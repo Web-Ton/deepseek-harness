@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import {
   constants,
   copyFileSync,
+  existsSync,
   globSync,
   mkdirSync,
   readFileSync,
@@ -28,7 +29,7 @@ import { tarballFiles } from '../../../scripts/release/tarball.ts'
 import { resolveDesktopTargetBuildPaths } from './desktop-build-paths.mjs'
 
 const DSH_PACKAGE = '@deepseek-ai/dsh'
-const ROOT_PACKAGES = [DSH_PACKAGE, DESKTOP_HOST_PACKAGE] as const
+const ROOT_PACKAGES = [DSH_PACKAGE, DESKTOP_HOST_PACKAGE, '@huaweicloud/aishell-dsh-base'] as const
 const APP_ROOT = resolve(import.meta.dirname, '..')
 const REPOSITORY_ROOT = resolve(APP_ROOT, '..', '..')
 
@@ -160,10 +161,12 @@ export function prepareDesktopPackageSet(inputs: readonly string[], output: stri
 
 function main(): void {
   const buildPaths = resolveDesktopTargetBuildPaths()
+  const aishellPlugins = join(REPOSITORY_ROOT, '..', 'aishell-dsh-plugins', 'packed', 'aishell')
   const defaultInputs = [
     buildPaths.packedDsh,
     buildPaths.packedVendor,
     buildPaths.packedLandlock,
+    ...(existsSync(aishellPlugins) ? [aishellPlugins] : []),
   ]
   const { values } = parseArgs({
     options: { from: { type: 'string', multiple: true }, out: { type: 'string' } },

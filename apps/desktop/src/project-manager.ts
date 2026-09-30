@@ -205,5 +205,7 @@ function linkAishellPluginPackages(projectDir: string): void {
 
 /** Create the first external plugin profile without running a package manager. */
 export function createPluginProfile(projectDir: string): void {
-  initProfile(projectDir, WEB_PROFILE.bundles)
+  // aishell brand distribution: the shipped profile preloads the aggregate
+  // Huawei Cloud plugin bundle alongside the official web bundles.
+  initProfile(projectDir, [...WEB_PROFILE.bundles, AISHELL_BUNDLE])
 }
