@@ -9,6 +9,8 @@ import {
   realpathSync,
   closeSync,
   readFileSync,
+  rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -164,10 +166,41 @@ export function createDevelopmentProjectMetadata(projectDir: string, release: De
       [DSH_PACKAGE]: release.version,
       [DESKTOP_HOST_PACKAGE]: release.version,
     },
-    dsh: { profile: { bundles: [...WEB_PROFILE.bundles] } },
+    dsh: { profile: { bundles: [...WEB_PROFILE.bundles, AISHELL_BUNDLE] } },
   }
   writeJson(join(projectDir, 'package.json'), manifest)
   writeFileSync(join(projectDir, 'pnpm-workspace.yaml'), workspaceFile(), { mode: 0o600 })
+  linkAishellPluginPackages(projectDir)
+}
+
+/** aishell brand-distribution: aggregate bundle mounting the Huawei Cloud plugin set. */
+const AISHELL_BUNDLE = '@huaweicloud/aishell-dsh-base'
+
+/** aishell brand-distribution: plugin packages linked from the sibling aishell-dsh-plugins checkout. */
+const AISHELL_PLUGIN_PACKAGES: ReadonlyArray<{ readonly source: string; readonly name: string }> = [
+  { source: 'aishell-base', name: 'aishell-dsh-base' },
+  { source: 'credentials-store', name: 'aishell-dsh-credentials-store' },
+  { source: 'aishell-tokenhub', name: 'aishell-dsh-tokenhub' },
+  { source: 'aishell-credentials', name: 'aishell-dsh-client-credentials' },
+  { source: 'aishell-brand', name: 'aishell-dsh-brand' },
+]
+
+/**
+ * aishell brand-distribution: link the Huawei Cloud plugin packages into the project's
+ * node_modules so the loader resolves the bundle without a package-manager run. Skipped
+ * silently when the sibling checkout is absent (stock upstream development).
+ */
+function linkAishellPluginPackages(projectDir: string): void {
+  const pluginsRoot = join(projectDir, '..', '..', '..', '..', '..', '..', 'aishell-dsh-plugins', 'packages')
+  const destinationRoot = join(projectDir, 'node_modules', '@huaweicloud')
+  for (const { source, name } of AISHELL_PLUGIN_PACKAGES) {
+    const sourceDir = join(pluginsRoot, source)
+    if (!existsSync(sourceDir)) continue
+    const destination = join(destinationRoot, name)
+    rmSync(destination, { recursive: true, force: true })
+    mkdirSync(destinationRoot, { recursive: true })
+    symlinkSync(realpathSync(sourceDir), destination, 'dir')
+  }
 }
 
 /** Create the first external plugin profile without running a package manager. */
