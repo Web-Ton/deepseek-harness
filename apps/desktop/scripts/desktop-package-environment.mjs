@@ -27,7 +27,7 @@ const FILE_SETTINGS = ['DSH_DESKTOP_WINDOWS_CER_FILE', 'DSH_DESKTOP_WINDOWS_SIGN
  * @returns {NodeJS.ProcessEnv} Isolated environment with file-owned release settings.
  */
 export function loadDesktopPackageEnvironment(platform, environment = process.env, appRoot = APP_ROOT) {
-  const path = join(appRoot, platform === 'win32' ? '.env.windows' : '.env.macos')
+  const path = join(appRoot, platform === 'win32' ? '.env.windows' : platform === 'linux' ? '.env.linux' : '.env.macos')
   let contents
   try {
     contents = readFileSync(path, 'utf8')
