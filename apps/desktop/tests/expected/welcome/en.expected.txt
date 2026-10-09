@@ -1,6 +1,5 @@
-DeepSeek Harness
-DeepSeek Harness
-Welcome to DeepSeek Harness
-Build potential. Explore intelligence.
-Sign in
-Add API Key
+AI Shell
+AI Shell
+Welcome to AI Shell
+Set up your Huawei Cloud credentials in the app after entering.
+Enter AI Shell

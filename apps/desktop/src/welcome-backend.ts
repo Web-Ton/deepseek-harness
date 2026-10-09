@@ -69,13 +69,16 @@ export async function connectDesktopWelcome(
     return envelope.result.value
   }
   const account = desktopAccountBackend(origin, invoke, cookies)
+  // aishell brand distribution: the DeepSeek account and key-provider plugins
+  // are disabled in the shipped profile, so their settings namespace and RPC
+  // namespace can be absent. Reads degrade to signed-out / no-key instead of
+  // failing startup; the welcome entry only needs those facts to be false.
   const settingsAndReference = async () => {
     const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
     if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
     const official: unknown = settings.namespaces.find((item: unknown) => record(item) && item.ns === 'llm-deepseek')
-    if (official === undefined) return { settings: { namespaces: settings.namespaces }, ref: undefined }
-    if (!record(official) || !record(official.value) || typeof official.value.apiKeyEnv !== 'string') {
-      throw new Error('desktop welcome: missing official DeepSeek credential reference')
+    if (official === undefined || !record(official) || !record(official.value) || typeof official.value.apiKeyEnv !== 'string') {
+      return { settings: { namespaces: settings.namespaces }, ref: undefined }
     }
     return { settings: { namespaces: settings.namespaces }, ref: official.value.apiKeyEnv }
   }
@@ -113,8 +116,11 @@ export async function connectDesktopWelcome(
       Object.assign(states, batch)
     }
     if (ref !== undefined && !record(states[ref])) throw new Error('desktop welcome: missing credential metadata')
+    // The account RPC namespace is absent in the aishell profile; treat any
+    // failure as signed-out so openInitialWindow keeps its welcome decision.
+    const loggedIn = await account.state().then(state => state.status === 'credential-stored').catch(() => false)
     return {
-      loggedIn: (await account.state()).status === 'credential-stored',
+      loggedIn,
       hasApiKey: Object.values(states).some(value => record(value) && value.configured === true),
       writable: ref !== undefined && record(states[ref]) && states[ref].writable === true,
       localePreference: localePreference(namespaces),
