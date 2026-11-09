@@ -1508,12 +1508,12 @@ async function main(): Promise<void> {
       { role: 'unhide', label: currentDesktopLocale().messages.showAllApplications }, { type: 'separator' }]
     : []
   const applicationItems = (): MenuItemConstructorOptions[] => [
-    // Windows has no system About panel; Electron's fallback is a plain
-    // message box, so the shell shows its own dimmed dialog instead.
-    process.platform === 'win32'
-      ? { label: currentDesktopLocale().messages.aboutMenu,
-        click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } }
-      : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
+    // AI Shell distribution (D15 rev12): the About item routes to the dist's
+    // own dialog on every platform - the macOS system panel (role 'about')
+    // reports the asar's base version, not the distribution's. macOS keeps
+    // its system panel aligned via setAboutPanelOptions for other triggers.
+    { label: currentDesktopLocale().messages.aboutMenu,
+      click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } },
     { type: 'separator' },
     { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
     // AI Shell distribution (aishell command): the upstream "Manage dsh

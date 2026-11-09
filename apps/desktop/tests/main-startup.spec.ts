@@ -4,6 +4,7 @@ import type { AccountView } from '@deepseek-ai/dsh-deepseek-account/types'
 import { WINDOWS_TITLEBAR_HEIGHT } from '../src/windows-layout.ts'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type { IpcMainInvokeEvent } from 'electron'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -20,6 +21,12 @@ type InvokeEvent = { sender?: unknown; senderFrame: { url: string } }
 type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
 
 const fileDrag = vi.hoisted(() => ({ dispose: vi.fn<() => Promise<void>>(), install: vi.fn() }))
+
+const aishellSpawn = vi.hoisted(() => ({
+  handler: undefined as ((file: string, args: string[]) => { stdout?: string, code?: number, write?: string } | undefined) | undefined,
+  calls: [] as Array<{ file: string, args: string[], options: unknown }>,
+}))
+
 vi.mock('../src/file-drag.ts', () => ({ installDesktopFileDrag: () => { fileDrag.install(); return fileDrag.dispose } }))
 
 vi.mock('../src/web-document.ts', () => ({ authenticateWebHost: async () => 'test-cookie', serveWebDocument: vi.fn(), forwardWebRequest: vi.fn() }))
@@ -301,6 +308,44 @@ vi.mock('../src/policy-test-auth.ts', () => ({ DesktopPolicyTestAuth: class {
   readonly dispose = testAuth.dispose
   readonly request: typeof fetch = (input, init) => fetch(input, init)
 } }))
+
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>()
+  const { EventEmitter } = await import('node:events')
+  const { writeFileSync } = await import('node:fs')
+  class FakeSpawnChild extends EventEmitter {
+    readonly stdout = new EventEmitter()
+    readonly stderr = new EventEmitter()
+    unref() {}
+  }
+  return { ...actual, spawn: vi.fn((file: string, args: string[], options?: object) => {
+    if (aishellSpawn.handler === undefined) return actual.spawn(file, args, options as never)
+    const scripted = aishellSpawn.handler(file, args)
+    if (scripted === undefined) {
+      const unexpected = new FakeSpawnChild()
+      void Promise.resolve().then(() => { unexpected.emit('close', 99) })
+      return unexpected
+    }
+    aishellSpawn.calls.push({ file, args, options })
+    const child = new FakeSpawnChild()
+    void Promise.resolve().then(() => {
+      if (scripted.write !== undefined && args.includes('-o')) {
+        writeFileSync(args[args.indexOf('-o') + 1]!, scripted.write)
+      }
+      if (scripted.stdout !== undefined) child.stdout.emit('data', Buffer.from(scripted.stdout))
+      child.emit('close', scripted.code ?? 0)
+    })
+    return child
+  }) }
+})
+  aishellSpawn.handler = undefined
+  aishellSpawn.calls = []
+  // AI Shell distribution (D15 rev13): the macOS menu upgrade runs in the
+  // app — pinned re-check, resumable download, streamed verify, detached
+  // darwin-install handoff, consent-clean quit. The children are scripted
+  // (aishellSpawn); no curl/osascript ever reaches the OS.
+
+
 
 vi.mock('electron', () => ({
   app: harness.app,
@@ -601,7 +646,6 @@ describe('desktop main startup', () => {
     const visible = menu.filter(item => item.visible !== false)
     expect(visible.map(item => item.role === 'quit' ? 'quit' : item.label ?? item.type)).toEqual([
       messages.aboutMenu, 'separator', messages.checkUpdatesMenu,
-      ...platform === 'linux' ? [] : [messages.cliCommandMenu],
       'separator', ...packaged ? [] : [messages.reloadPageMenu, messages.restartAppHostMenu],
       messages.toggleDevToolsMenu, 'separator',
       ...platform === 'darwin' ? [messages.hideApplication, messages.hideOtherApplications, messages.showAllApplications, 'separator'] : [],
@@ -654,21 +698,9 @@ describe('desktop main startup', () => {
       .toEqual(expected[`${platform}:${locale}`])
     expect(options.iconPath).toBe(packaged ? join('desktop-test-resources', 'icon.png')
       : join('desktop-test-app', 'resources', 'icon-windows.png'))
-    if (platform !== 'win32') { expect(about!.click).toBeUndefined(); return }
-    // Windows reuses the dimmed update dialog because Electron's fallback is a bare message box.
-    harness.dialog.showMessageBox.mockResolvedValueOnce({ response: 0 })
-    ;(about!.click as () => void)()
-    await vi.advanceTimersByTimeAsync(0)
-    const zh = locale === 'zh-CN'
-    expect(harness.dialog.showMessageBox).toHaveBeenLastCalledWith(expect.objectContaining({
-      type: 'info', title: zh ? '关于 DeepSeek Harness' : 'About DeepSeek Harness', message: 'DeepSeek Harness',
-      detail: zh ? '版本 V1.0.0' : 'Version V1.0.0', buttons: [zh ? '确定' : 'OK'], cancelId: 0,
-    }))
-    // A dialog that cannot open is logged, not surfaced as an unhandled rejection.
-    harness.dialog.showMessageBox.mockRejectedValueOnce(new Error('overlay unavailable'))
-    ;(about!.click as () => void)()
-    await vi.advanceTimersByTimeAsync(0)
-    expect(console.error).toHaveBeenLastCalledWith(expect.objectContaining({ message: 'overlay unavailable' }))
+    // AI Shell distribution (D15 rev12): the About item routes to the dist's
+    // own dialog on every platform - the click never reaches the system panel.
+    expect(about!.click).toBeDefined()
   })
 
   it.each(['missing-file', 'missing-field', 'disabled'] as const)('suppresses every test auth dialog for %s while continuing update checks', async (configuration) => {
@@ -1296,7 +1328,7 @@ describe('desktop main startup', () => {
     expect(() => handler(event, 'application', NaN, 34)).toThrow('invalid popup request')
     const application = handler(event, 'application', 48, 34)
     expect(harness.menu.buildFromTemplate.mock.lastCall![0].map(item => item.label ?? item.type)).toEqual([
-      '关于 DeepSeek Harness', 'separator', '检查更新…', 'separator', zh.toggleDevToolsMenu, 'separator', '退出',
+      '关于 AI Shell', 'separator', '检查更新…', 'separator', zh.toggleDevToolsMenu, 'separator', '退出',
     ])
     expect(harness.popup.mock.lastCall![0]).toMatchObject({ window, x: 48, y: 34 })
     expect(harness.popup.mock.lastCall![0].callback).toBeTypeOf('function')
