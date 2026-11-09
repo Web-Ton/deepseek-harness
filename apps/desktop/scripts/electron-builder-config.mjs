@@ -106,7 +106,7 @@ export function createElectronBuilderConfig(
   const packaged = resolveDesktopBuildCommit(env)
   return {
     appId,
-    protocols: [{ name: 'DeepSeek Harness', schemes: ['dsh'] }],
+    protocols: [{ name: 'AI Shell', schemes: ['dsh'] }],
     extraMetadata: {
       dshDesktopAppId: appId,
       dshDesktopUpdateChannel: update?.channel ?? 'nightly',
@@ -114,7 +114,7 @@ export function createElectronBuilderConfig(
       ...buildVersion === productVersion ? {} : { version: buildVersion },
       ...packaged === undefined ? {} : { dshBuildCommit: packaged.commit, dshBuildDirty: packaged.dirty },
     },
-    productName: 'DeepSeek Harness',
+    productName: 'AI Shell',
     // The default copyright uses author.name; this line names the product instead.
     copyright: `Copyright © ${new Date().getFullYear()} \${productName}`,
     // Unsigned builds carry their own suffix so a shared file can never pass for a release artifact.
@@ -160,6 +160,16 @@ export function createElectronBuilderConfig(
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
+      // AI Shell: payload injected pre-pack so the one-shot packager seals it
+      // into the artifact (.exe via NSIS, .dmg via hdiutil — both are sealed
+      // once written; post-inject cannot reach either).
+      ...((packagesWindows || packagesMacOS) ? [{ from: join(buildPaths.root, 'aishell-payload'), to: 'aishell-payload', filter: ['**/*'] }] : []),
+      // AI Shell (A3): version identity + first-party updater ride the same
+      // pre-pack seal for Windows; non-Windows keeps the post-build inject.
+      ...(packagesWindows ? [
+        { from: join(buildPaths.root, 'aishell-update-src'), to: 'aishell-update', filter: ['**/*'] },
+        { from: join(buildPaths.root, 'aishell-version'), to: 'aishell-version' },
+      ] : []),
     ],
     mac: {
       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),
@@ -167,7 +177,7 @@ export function createElectronBuilderConfig(
       // macOS matches the application locale against this bundle, not Electron Framework resources.
       extendInfo: {
         CFBundleLocalizations: ['en', 'zh_CN', 'ja', 'es', 'fr', 'de', 'ru', 'pt'],
-        NSMicrophoneUsageDescription: 'DeepSeek Harness uses your microphone to transcribe speech into message drafts.',
+        NSMicrophoneUsageDescription: 'AI Shell uses your microphone to transcribe speech into message drafts.',
       },
       // Ad-hoc signing keeps the modified Electron executable runnable without a Developer ID.
       identity: unsigned ? '-' : macOSSigning?.signingIdentity,

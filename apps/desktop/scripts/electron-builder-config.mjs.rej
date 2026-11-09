@@ -1,0 +1,12 @@
+diff a/apps/desktop/scripts/electron-builder-config.mjs b/apps/desktop/scripts/electron-builder-config.mjs	(rejected hunks)
+@@ -158,6 +158,10 @@ export function createElectronBuilderConfig(
+       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
+       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
+       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
++      // AI Shell: payload injected pre-pack so the one-shot packager seals it
++      // into the artifact (.exe via NSIS, .dmg via hdiutil — both are sealed
++      // once written; post-inject cannot reach either).
++      ...((packagesWindows || packagesMacOS) ? [{ from: join(buildPaths.root, 'aishell-payload'), to: 'aishell-payload', filter: ['**/*'] }] : []),
+     ],
+     mac: {
+       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),
