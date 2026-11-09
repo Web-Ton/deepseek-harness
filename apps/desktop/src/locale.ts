@@ -125,6 +125,15 @@ export const en = {
   updateClose: 'Close',
   updateAcknowledge: 'OK',
   updateLater: 'Update later',
+  // AI Shell distribution (D15): mac first-release fallback — no packaged
+  // launcher means the download action degrades to a manual instruction.
+  updateManualDownloadTitle: 'Download the update manually',
+  updateManualDownloadDetail: 'This build cannot install updates automatically. Download the new version from the release page and replace the app manually.',
+  // AI Shell distribution (D15 rev13): macOS background-upgrade notification.
+  updateBackgroundDownload: 'Downloading the update in the background — it will close and install automatically when done.',
+  // AI Shell distribution (D15, changelog task 2026-10-22): header for the
+  // optional feed changelog block in the update-available dialog.
+  updateWhatsNew: "What's new:",
   updateDownloading: 'Downloading {percent}%…',
   updateVerifying: 'Verifying update files…',
   updateInstalling: 'Preparing to restart…',
@@ -305,6 +314,13 @@ export const zh = {
   updateClose: '关闭',
   updateAcknowledge: '确定',
   updateLater: '稍后更新',
+  updateManualDownloadTitle: '请手动下载更新',
+  updateManualDownloadDetail: '此版本不支持自动安装更新。请到发布页下载新版本，并手动替换应用。',
+  // AI Shell distribution (D15 rev13): macOS background-upgrade notification.
+  updateBackgroundDownload: '正在后台下载更新，完成后将自动关闭并安装。',
+  // AI Shell distribution (D15, changelog task 2026-10-22): update-available
+  // dialog's optional changelog block header.
+  updateWhatsNew: '更新内容:',
   updateDownloading: '正在下载 {percent}%…',
   updateVerifying: '正在校验更新文件…',
   updateInstalling: '正在准备重启…',

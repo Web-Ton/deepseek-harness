@@ -722,6 +722,197 @@ describe('desktop main startup', () => {
       .not.toContain(en.policyLoginRequired)
   })
 
+  // AI Shell distribution (D15 rev13): the macOS menu upgrade runs in the
+  // app — pinned re-check, resumable download, streamed verify, detached
+  // darwin-install handoff, consent-clean quit. The children are scripted
+  // (aishellSpawn); no curl/osascript ever reaches the OS.
+  const macFeed = (update: object | null) => JSON.stringify({ version: '0.0.1-alpha.1', target: 'mac-x64',
+    update, fromCache: false, error: null })
+  const bootAishellMenu = async (feed: string, platform = 'darwin'): Promise<string> => {
+    const resources = mkdtempSync(join(tmpdir(), 'dsh-aishell-mac-'))
+    onTestFinished(() => rmSync(resources, { recursive: true, force: true }))
+    mkdirSync(join(resources, 'aishell-update'), { recursive: true })
+    writeFileSync(join(resources, 'aishell-update', 'aishell-update.mjs'), '# packaged module stand-in\n')
+    vi.stubGlobal('process', { ...process, platform, resourcesPath: resources })
+    aishellSpawn.handler = (_file, args) => args.includes('check') ? { stdout: feed } : {}
+    await readyForUpdate()
+    return resources
+  }
+  const menuCheckClick = (): void => {
+    const checkUpdates = applicationMenuItems().find(item => item.label === en.checkUpdatesMenu)!.click as () => void
+    checkUpdates()
+  }
+
+  /** zh-locale variant of menuCheckClick (the label is the zh dictionary's). */
+  const menuCheckClickZh = (): void => {
+    const checkUpdates = applicationMenuItems().find(item => item.label === zh.checkUpdatesMenu)!.click as () => void
+    checkUpdates()
+  }
+
+  it('runs the macOS menu upgrade in-app: pinned re-check, download, verify, handoff, quit', async () => {
+    const artifact = 'fake-dmg-bytes'
+    const sha256 = createHash('sha256').update(artifact).digest('hex')
+    const feed = macFeed({ version: '0.0.1-alpha.9', url: 'ai-shell-mac-x64.dmg',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg', sha256 })
+    const resources = await bootAishellMenu(feed)
+    let handedOff!: (installArgs: string[]) => void
+    const handoff = new Promise<string[]>(resolve => { handedOff = resolve })
+    aishellSpawn.handler = (file, args) => {
+      if (args.includes('darwin-install')) { handedOff(args); return {} }
+      if (args.includes('check')) return { stdout: feed }
+      if (file === 'curl') return { write: artifact }
+      return {}
+    }
+    harness.dialog.showMessageBox.mockResolvedValue({ response: 0 })
+    // Real timers for the click→handoff window: the download chain's fs
+    // streams settle on setImmediate, which the suite's fake timers pin.
+    vi.useRealTimers()
+    menuCheckClick()
+    const installArgs = await handoff
+    vi.useFakeTimers()
+    expect(installArgs).toEqual(['--expose-internals', join(resources, 'aishell-update', 'aishell-update.mjs'),
+      'darwin-install', expect.any(String), '0.0.1-alpha.9', String(process.pid)])
+    const dmgPath = installArgs[3]!
+    expect(readFileSync(dmgPath, 'utf8')).toBe(artifact)
+    expect(aishellSpawn.calls.find(call => call.file === 'curl')!.args).toEqual(
+      ['-fL', '--retry', '3', '-C', '-', '-o', dmgPath, 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg'])
+    expect(aishellSpawn.calls.filter(call => call.args.includes('check'))).toHaveLength(2)
+    expect(aishellSpawn.calls.some(call => call.file === 'osascript')).toBe(true)
+    const install = aishellSpawn.calls.find(call => call.args.includes('darwin-install'))!
+    expect(install.options).toMatchObject({ detached: true, stdio: 'ignore' })
+    expect((install.options as { env?: Record<string, string | undefined> }).env).toMatchObject(
+      { ELECTRON_RUN_AS_NODE: '1', AISHELL_UPGRADE_LOCALE: 'en' })
+    expect(harness.app.quit).toHaveBeenCalled()
+    rmSync(dirname(dmgPath), { recursive: true, force: true })
+  })
+
+  it('answers the macOS upgrade click with the up-to-date box when the pinned re-check finds nothing', async () => {
+    const updateFeed = macFeed({ version: '0.0.1-alpha.9', url: 'ai-shell-mac-x64.dmg',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg', sha256: 'a'.repeat(64) })
+    await bootAishellMenu(updateFeed)
+    let checks = 0
+    aishellSpawn.handler = (_file, args) => {
+      if (!args.includes('check')) return {}
+      checks += 1
+      return { stdout: checks === 1 ? updateFeed : macFeed(null) }
+    }
+    harness.dialog.showMessageBox.mockResolvedValue({ response: 0 })
+    menuCheckClick()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(harness.dialog.showMessageBox.mock.calls.map(call => (call.at(-1) as { message: string }).message))
+      .toContain(en.updateCurrent)
+    expect(aishellSpawn.calls.some(call => call.file === 'curl')).toBe(false)
+    expect(aishellSpawn.calls.some(call => call.args.includes('darwin-install'))).toBe(false)
+    expect(harness.app.quit).not.toHaveBeenCalled()
+  })
+
+  it('keeps the macOS upgrade app alive on checksum mismatch and shows the failure box', async () => {
+    const artifact = 'fake-dmg-bytes'
+    const wrongSha = createHash('sha256').update('other-bytes').digest('hex')
+    const feed = macFeed({ version: '0.0.1-alpha.9', url: 'ai-shell-mac-x64.dmg',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg', sha256: wrongSha })
+    await bootAishellMenu(feed)
+    let failed!: (detail: unknown) => void
+    const failureShown = new Promise<unknown>(resolve => { failed = resolve })
+    harness.dialog.showMessageBox.mockImplementation((options: { type?: string, technicalDetails?: string }) => {
+      if (options.type === 'warning') failed(options.technicalDetails)
+      return Promise.resolve({ response: 0 })
+    })
+    aishellSpawn.handler = (file, args) => {
+      if (args.includes('check')) return { stdout: feed }
+      if (file === 'curl') return { write: artifact }
+      return {}
+    }
+    // Real timers for the click→failure window: the streamed sha256 verify
+    // settles on setImmediate, which the suite's fake timers pin.
+    vi.useRealTimers()
+    menuCheckClick()
+    const technical = await failureShown
+    vi.useFakeTimers()
+    expect(String(technical)).toContain('checksum mismatch')
+    expect(aishellSpawn.calls.some(call => call.args.includes('darwin-install'))).toBe(false)
+    expect(harness.app.quit).not.toHaveBeenCalled()
+  })
+
+  it('keeps the non-macOS manual-download fallback when the packaged launcher is absent', async () => {
+    const feed = macFeed({ version: '0.0.1-alpha.9', url: 'ai-shell-win-x64.tar.gz',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64) })
+    await bootAishellMenu(feed, 'win32')
+    let shown!: () => void
+    const manualShown = new Promise<void>(resolve => { shown = () => resolve() })
+    harness.dialog.showMessageBox.mockImplementation((options: { message?: string }) => {
+      if (options.message === en.updateManualDownloadTitle) shown()
+      return Promise.resolve({ response: 0 })
+    })
+    menuCheckClick()
+    await manualShown
+    await vi.advanceTimersByTimeAsync(0)
+    expect(aishellSpawn.calls.some(call => call.file === 'curl')).toBe(false)
+    expect(aishellSpawn.calls.some(call => call.args.includes('darwin-install'))).toBe(false)
+    expect(harness.app.quit).not.toHaveBeenCalled()
+  })
+
+  // AI Shell distribution (D15, changelog task 2026-10-22): the feed's
+  // optional changelog heads the update-available dialog's detail in the UI
+  // language; a missing key hides the block (never the other language).
+  // Platform win32 + no aishell.cmd + response 1 (暂不) keeps the install
+  // chains out of the way — this is a dialog-content test, not a chain test.
+  // uiLanguages (default en) stubs the OS languages BEFORE the boot: main()
+  // resolves its locale once at startup, so the spy must precede
+  // readyForUpdate (found when the zh case booted en-first and found no
+  // zh header — locale was already frozen).
+  const changelogDialog = async (update: object | null, uiLanguages: readonly string[] = ['en-US']): Promise<string | undefined> => {
+    const feed = macFeed(update)
+    const getLanguages = vi.spyOn(harness.app, 'getPreferredSystemLanguages').mockReturnValue([...uiLanguages])
+    try {
+      await bootAishellMenu(feed, 'win32')
+    } finally {
+      getLanguages.mockRestore()
+    }
+    let captured!: () => void
+    const dialogShown = new Promise<void>(resolve => { captured = () => resolve() })
+    let detail: string | undefined
+    harness.dialog.showMessageBox.mockImplementation((options: { message?: string, detail?: string }) => {
+      detail = options.detail
+      captured()
+      return Promise.resolve({ response: 1 })
+    })
+    ;(uiLanguages[0]?.toLowerCase().startsWith('zh') ? menuCheckClickZh : menuCheckClick)()
+    await dialogShown
+    await vi.advanceTimersByTimeAsync(0)
+    return detail
+  }
+
+  it('heads the update dialog detail with the feed changelog for the UI language', async () => {
+    const detail = await changelogDialog({ version: '0.0.1-alpha.9', url: 'ai-shell-win-x64.tar.gz',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64),
+      changelog: { en: '- New: see what changed', zh: '- 新增:更新内容' } })
+    expect(detail).toBe(`${en.updateWhatsNew}\n- New: see what changed\n\n${en.updateDownloadedDetail}`)
+  })
+
+  it('picks the zh changelog when the UI language is zh-CN', async () => {
+    const detail = await changelogDialog({ version: '0.0.1-alpha.9', url: 'ai-shell-win-x64.tar.gz',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64),
+      changelog: { en: '- New: see what changed', zh: '- 新增:更新内容' } }, ['zh-CN'])
+    expect(detail).toContain('更新内容:')
+    expect(detail).toContain('- 新增:更新内容')
+    expect(detail).not.toContain('What\'s new:')
+    expect(detail).not.toContain('- New: see what changed')
+  })
+
+  it('hides the changelog block entirely when the language key is missing', async () => {
+    const detail = await changelogDialog({ version: '0.0.1-alpha.9', url: 'ai-shell-win-x64.tar.gz',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64),
+      changelog: { zh: '- 新增:更新内容' } })
+    expect(detail).toBe(en.updateDownloadedDetail)
+  })
+
+  it('renders exactly today\'s detail when the feed carries no changelog', async () => {
+    const detail = await changelogDialog({ version: '0.0.1-alpha.9', url: 'ai-shell-win-x64.tar.gz',
+      artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64) })
+    expect(detail).toBe(en.updateDownloadedDetail)
+  })
+
   it.each([false, true])('retains anonymous production checks with popup permission %s', async (allow) => {
     configureTestAuthPopup(allow)
     harness.embeddedPolicy = { origin: 'https://policy.example.com', authentication: 'anonymous',

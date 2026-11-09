@@ -3,7 +3,9 @@ import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-prod
 import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
 /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
 
-import { access, readFile, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { createReadStream, existsSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -471,6 +473,10 @@ async function main(): Promise<void> {
     ordinaryDialogs.add(controller)
     try {
       const parent = currentDialogWindow()
+      // AI Shell distribution (D14 rev6 instrumentation): the silent no-parent
+      // return is a real "clicked but nothing appeared" cause when no window is
+      // alive — make it visible in stdout instead of vanishing.
+      if (parent === undefined) console.warn('aishell update check: no parent window — dialog suppressed')
       if (parent === undefined) return { response: options.cancelId ?? 0, checkboxChecked: false }
       return await updateDialog.show(parent, { ...options, signal: controller.signal })
     }
@@ -479,9 +485,332 @@ async function main(): Promise<void> {
   // Copy comes from the same locale as the update prompts so the dialog
   // chrome and its content never mix languages.
   const showAbout = async (): Promise<void> => {
+    // AI Shell distribution (D14): the About box reports the DISTRIBUTION's
+    // own identity, never the base version alone (app.getVersion() reports
+    // the upstream base — not what a user comparing releases needs on its
+    // own). Two lines: the app (dist) version from the A3 version file, and
+    // the DSH base version from app.getVersion(); dev runs without the
+    // version file degrade to the official single-line form.
+    let appVersion: string | undefined
+    try {
+      appVersion = (await readFile(join(process.resourcesPath, 'aishell-version'), 'utf8')).trim()
+    } catch { /* dev layout — no version file */ }
+    // Localized labels (zh: 应用版本/DSH 版本, others: App/DSH version) — the
+    // About box follows the UI language, never mixed bilingual.
+    const zh = locale.id === 'zh-CN'
+    const appLabel = zh ? '应用版本' : 'App version'
+    const dshLabel = zh ? 'DSH 版本' : 'DSH version'
+    const detail = appVersion === undefined
+      ? formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() })
+      : `${appLabel} ${appVersion}\n${dshLabel} ${app.getVersion()}`
     await ordinaryMessageBox({ type: 'info', title: locale.messages.aboutMenu, message: locale.messages.aboutProduct,
-      detail: formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }),
+      detail,
       buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+  }
+  // AI Shell distribution (D15 rev13, macOS upgrade chain — desktop half):
+  // the 下载更新 click on darwin runs IN the app — pinned re-check,
+  // resumable curl download, streamed sha256 verify — so the user keeps
+  // working while the artifact lands, with osascript notifications
+  // carrying the phases (the accepted notification-level UX; no percent
+  // surface). The verified dmg then hands off to the update module's
+  // darwin-install subcommand and the app quits itself cleanly
+  // (shellInstallerOwnsQuit: the click was the consent — the quit question
+  // must not ask twice). Linux/Windows keep the packaged-launcher chain
+  // inside checkAishellUpdates below.
+  // AI Shell distribution (D15, changelog task 2026-10-22): the optional
+  // feed changelog rides the check result; display-only, absent key = no
+  // block (one window one language — never the other language).
+  type AishellCheckResult = { update: { version: string, artifactUrl?: string, sha256?: string, changelog?: { en?: string, zh?: string } } | null, version: string, error: string | null }
+  // One spawn handle per helper, passed (not re-imported): two concurrent
+  // dynamic imports of the same mocked builtin race in the module runner —
+  // the loser resolves the NATIVE module and escapes the test double
+  // (found while driving this chain in main-startup.spec).
+  const showMacNotification = (spawn: typeof import('node:child_process')['spawn'], body: string): void => {
+    const escaped = body.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
+    const child = spawn('osascript', ['-e', `display notification "${escaped}" with title "AI Shell"`], { stdio: 'ignore' })
+    child.on('error', () => undefined) // notifications are best-effort
+  }
+  const runAishellCheck = async (module: string): Promise<AishellCheckResult> => {
+    const { spawn } = await import('node:child_process')
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--expose-internals', module, 'check', '--json', '--force'], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString('utf8') })
+      child.on('error', reject)
+      child.on('close', (code: number | null) => { code === 0 ? resolve(out) : reject(new Error(`exit ${code ?? 'signal'}`)) })
+    })
+    return JSON.parse(stdout) as AishellCheckResult
+  }
+  const runMacAishellUpgrade = async (module: string): Promise<void> => {
+    const fail = async (technical: string): Promise<void> => {
+      await ordinaryMessageBox({ type: 'warning', title: locale.messages.updateCheckTitle, message: locale.messages.updateCheckTitle,
+        detail: locale.messages.updateCheckFailed, technicalDetails: technical,
+        buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+    }
+    // Pinned re-check at click time (the dialog that asked may have aged in
+    // a cache): the bytes installed must be the bytes the feed named when
+    // the user said yes — the same law as `aishell upgrade`'s pre-flight.
+    let pinned: AishellCheckResult
+    try { pinned = await runAishellCheck(module) } catch (error) { await fail(error instanceof Error ? error.message : String(error)); return }
+    if (pinned.update === null) {
+      if (pinned.error !== null) { await fail(pinned.error); return }
+      await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+        message: locale.messages.updateCurrent,
+        detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: pinned.version }),
+        buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+      return
+    }
+    const update = pinned.update
+    if (update.artifactUrl === undefined || update.sha256 === undefined) {
+      await fail('feed entry lacks artifactUrl/sha256 — the packaged update module predates the macOS chain')
+      return
+    }
+    const artifactUrl = update.artifactUrl
+    const sha256 = update.sha256
+    const { spawn } = await import('node:child_process')
+    showMacNotification(spawn, formatDesktopMessage(locale.messages.updateBackgroundDownload, { }))
+    const workDir = await mkdtemp(join(tmpdir(), 'aishell-upgrade-'))
+    const dmgPath = join(workDir, 'update.dmg')
+    try {
+      // Resumable download, five attempts — install.sh's fetch contract
+      // (mid-body resets on long-haul links are not in curl's transient
+      // list; -C - resumes from the partial file).
+      for (let attempt = 1; ; attempt++) {
+        const ok = await new Promise<boolean>((resolve, reject) => {
+          const child = spawn('curl', ['-fL', '--retry', '3', '-C', '-', '-o', dmgPath, artifactUrl], { stdio: 'ignore' })
+          child.on('error', reject)
+          child.on('close', (code: number | null) => { resolve(code === 0) })
+        })
+        if (ok) break
+        if (attempt === 5) throw new Error(`curl download failed (attempt ${attempt})`)
+      }
+      // Streamed verify — a ~450MB dmg never buffers whole.
+      const { createHash } = await import('node:crypto')
+      const hash = createHash('sha256')
+      await new Promise<void>((resolve, reject) => {
+        createReadStream(dmgPath)
+          .on('data', (chunk: string | Buffer) => { hash.update(chunk) })
+          .on('error', reject)
+          .on('end', () => { resolve() })
+      })
+      const actual = hash.digest('hex')
+      if (actual !== sha256) throw new Error(`checksum mismatch (expected ${sha256.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`)
+    } catch (error) {
+      rmSync(workDir, { recursive: true, force: true })
+      await fail(error instanceof Error ? error.message : String(error))
+      return
+    }
+    // Hand off: the detached module survives this app's exit, finishes the
+    // install (mount/replace/relaunch), and owns its log + failure dialogs
+    // (its darwin-install subcommand removes the dmg and its workdir).
+    // AISHELL_UPGRADE_LOCALE keeps the module's dialogs in the app language.
+    showMacNotification(spawn, formatDesktopMessage(locale.messages.updateInstalling, { }))
+    const child = spawn(process.execPath, ['--expose-internals', module, 'darwin-install', dmgPath, update.version, String(process.pid)], {
+      detached: true, stdio: 'ignore',
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1',
+        AISHELL_UPGRADE_LOCALE: locale.id === 'zh-CN' ? 'zh' : 'en' } })
+    child.unref()
+    shellInstallerOwnsQuit = true
+    app.quit()
+  }
+  // AI Shell distribution (D14 first-party update check): the official
+  // "Check for Updates…" menu item and the renderer's updatesOpen IPC both
+  // used to drive the official electron-updater chain, which is inert in
+  // unsigned builds (no app-update.yml) — the menu item answered a click
+  // with nothing. This replacement asks the DISTRIBUTION's own updater
+  // (resources/aishell-update/aishell-update.mjs, A3) and reports the
+  // result through the same dialog surface as About. The user decision
+  // law: this only INFORMS (and names the upgrade command); it never
+  // installs anything — `aishell upgrade` (user-invoked) owns the install
+  // chain. Dev runs without the module stay stock: the click falls back to
+  // the official prompt exactly as upstream shipped it.
+  //
+  // ASYNC LAW (revision after a real VM test): the check runs OFF the menu
+  // click's critical path — a synchronous await here froze the menu IPC
+  // for the Electron cold start + feed fetch (seconds), and a window
+  // close during that window collided with the official quit
+  // confirmation's focus handling (close button appeared dead). The click
+  // now returns instantly; the dialog appears whenever the check lands.
+  // Concurrent clicks join one in-flight check instead of stacking.
+  let aishellCheckOperation: Promise<void> | undefined
+  const checkAishellUpdates = (): void => {
+    aishellCheckOperation ??= (async (): Promise<void> => {
+      const module = join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs')
+      // AishellCheckResult (not a narrower inline shape): the dialog below
+      // reads update.changelog for the detail block — the narrow
+      // `{ version: string }` form type-checked only under vitest's
+      // esbuild (no type gate) and failed the real build's tsc
+      // (found 2026-10-22 on the alpha.39 experience build).
+      let result: AishellCheckResult
+      try {
+        result = await runAishellCheck(module)
+      } catch (error: unknown) {
+        result = { update: null, version: app.getVersion(), error: error instanceof Error ? error.message : String(error) }
+      }
+      aishellCheckOperation = undefined
+      // Instrumentation (D14 rev6): every field report of "clicked, nothing
+      // appeared" came without any trace. Log the full decision so the
+      // app's stdout (the wrapper terminal) always tells which branch ran:
+      // the check result, the dialog branch, and any silent-return cause.
+      console.info(`aishell update check: local=${result.version} update=${result.update?.version ?? 'none'} error=${result.error ?? 'none'}`)
+      if (result.error !== null && result.update === null) {
+        await ordinaryMessageBox({ type: 'warning', title: locale.messages.updateCheckTitle, message: locale.messages.updateCheckTitle,
+          // rev8: official copy; the technical reason rides technicalDetails
+          // (the dialog's expandable diagnostics field), not the detail line.
+          detail: locale.messages.updateCheckFailed,
+          technicalDetails: String(result.error), buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+        return
+      }
+      if (result.update === null) {
+        // Official copy exactly (updateCurrent / updateCurrentDetail) — the
+        // version shown is the DISTRIBUTION version from the first-party
+        // check result, never app.getVersion() (which reports the base
+        // version) and never the plugin-set version.
+        await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+          message: locale.messages.updateCurrent,
+          detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: result.version }),
+          buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+        return
+      }
+      // rev8: user-decision dialog — a new version gets REAL choices, not an
+      // acknowledge-only box. Official copy (updateDownloadedTitle + detail);
+      // buttons: 立即升级 runs the user-owned install chain via the packaged
+      // launcher (same chain as the startup question and `aishell upgrade`);
+      // 暂不 (updateLater) dismisses — the menu item remains the door back,
+      // and no decline is recorded here (this was a user-initiated check).
+      // Changelog block (2026-10-22): the feed's optional changelog for the
+      // UI language heads the detail; a missing key hides the whole block
+      // (never the other language) and the detail is exactly today's.
+      const changelog = locale.id === 'zh-CN' ? result.update.changelog?.zh : result.update.changelog?.en
+      const detail = changelog === undefined
+        ? formatDesktopMessage(locale.messages.updateDownloadedDetail, { })
+        : `${locale.messages.updateWhatsNew}\n${changelog}\n\n${formatDesktopMessage(locale.messages.updateDownloadedDetail, { })}`
+      const choice = await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+        message: formatDesktopMessage(locale.messages.updateDownloadedTitle, { version: result.update.version }),
+        detail,
+        buttons: [locale.messages.updateDownload, locale.messages.updateLater], cancelId: 1 })
+      if (choice.response === 0) {
+        // AI Shell distribution (D15 rev13): macOS runs the in-app chain
+        // (download + verify here, install via the module's darwin-install
+        // after a clean quit). The packaged launcher below stays the
+        // Linux/Windows install chain, and its absence there (stripped
+        // artifact) still degrades to the manual-download instruction.
+        if (process.platform === 'darwin') {
+          await runMacAishellUpgrade(module)
+          return
+        }
+        // AI Shell distribution (D15 win32 upgrade path, 2026-10-20):
+        // the 下载更新 click must close the running app before the install
+        // chain can replace the exe. On win32 the Host's task-protection
+        // protocol is reachable ONLY while the app is alive (Host IPC), so
+        // this hunk owns the graceful-shutdown sequence — mirroring the
+        // official beforeRestart hook (main.ts:591-638) — BEFORE spawning
+        // aishell-upgrade.mjs. The chain (ACK=1) then handles only the
+        // residual Electron shell. Skipping task protection here would hard-
+        // kill the Host and lose the user's running work (W-U15).
+        if (process.platform === 'win32') {
+          // Stripped-artifact guard BEFORE task protection: a missing
+          // aishell-upgrade.mjs degrades to the manual-download instruction
+          // (same law as the Linux launcher guard below) — checking first
+          // avoids locking the Host for an install that can never run.
+          const upgradeModule = join(process.resourcesPath, 'aishell-update', 'aishell-upgrade.mjs')
+          if (!existsSync(upgradeModule)) {
+            await ordinaryMessageBox({ type: 'info', title: locale.messages.updateManualDownloadTitle,
+              message: locale.messages.updateManualDownloadTitle,
+              detail: locale.messages.updateManualDownloadDetail,
+              buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+            return
+          }
+          const host = backend.host
+          if (host !== undefined) {
+            // Inspect active tasks; if any, ask the user to stop them
+            // (official updateActiveTasks copy + stopTasks/updateLater).
+            const active = await host.updateTasks('inspect')
+            if (active) {
+              const confirm = await ordinaryMessageBox({ type: 'warning',
+                title: locale.messages.updateTitle,
+                message: locale.messages.updateActiveTasks,
+                detail: locale.messages.updateActiveTasksDetail,
+                buttons: [locale.messages.updateStopTasks, locale.messages.updateLater],
+                defaultId: 1, cancelId: 1 })
+              if (confirm.response !== 0) return  // user chose "later" — no install
+            }
+            // Lock: reject new task HTTP, then gracefully stop the Host.
+            // unlock on failure so a stopped-host error doesn't strand the lock.
+            await host.updateTasks('lock')
+            try {
+              await platformView.closeAndWait()
+              await backend.stop()
+            } catch (error) {
+              await host.updateTasks('unlock').catch((unlockError: unknown) => { console.error(unlockError) })
+              throw error
+            }
+          }
+          // Host stopped (or never running) → spawn the upgrade chain via
+          // cmd.exe /c start. Two problems this solves (both field-proven):
+          //   1. Quote trap: an earlier rev used `cmd /d /s /c "${cmd}" upgrade`
+          //      but cmd /s strips the outer quote pair, leaving the spaced
+          //      default install path (…\Programs\AI Shell\…) bare — cmd splits
+          //      at the space and exits 1, the chain never started.
+          //   2. Job kill: `spawn(process.execPath, …, { detached: true })` stays
+          //      in the Electron process's Job Object; app.quit() closes the Job
+          //      and the detached child is killed mid-download (died at ~65%).
+          // `start ""` creates a fully independent process that breaks away
+          // from the Job (field-proven: child survives parent exit). The first
+          // "" is the mandatory empty window title; each spaced arg quoted.
+          // Spawning process.execPath directly (not aishell.cmd) avoids the
+          // CVE-2024-27980 .cmd-without-shell gate and the cmd /s quote trap
+          // in one move. aishell-upgrade.mjs resolves its own stateDir from
+          // USERPROFILE, no DSH_HOME needed. Detached + unref: the chain
+          // outlives this app's process. ACK=1 = consent to close was given
+          // above (or no app was running). AISHELL_FROM_WRAPPER stripped so
+          // the chain relaunches the new version (same law as the Linux path).
+          const { spawn } = await import('node:child_process')
+          const child = spawn('cmd.exe', ['/d', '/c', 'start', '""',
+            `"${process.execPath}"`, `"${upgradeModule}"`, 'upgrade'], {
+            detached: true, stdio: ['ignore', 'ignore', 'ignore'],
+            windowsVerbatimArguments: true,
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', AISHELL_UPGRADE_ACK: '1', AISHELL_FROM_WRAPPER: undefined } })
+          child.unref()
+          // Quit the Electron main process after spawning the detached upgrade
+          // chain: backend.stop() halted the Host (the "重新连接中" the UI shows),
+          // but the Electron shell stays alive holding the exe file lock — NSIS /S
+          // cannot replace a running exe. The official beforeRestart hook relies
+          // on quitAndInstall() to do this; the A3 chain owns the reinstall, so
+          // app.quit() here releases the lock and closes the window. The detached
+          // child (unref'd) outlives this process and relaunches the new version.
+          app.quit()
+        } else {
+          // AI Shell distribution (D15): the packaged launcher owns the
+          // Linux install chain; a stripped artifact (no launcher) degrades
+          // to the manual-download instruction instead of an ENOENT crash.
+          const launcher = join(process.resourcesPath, 'aishell-launcher', 'aishell')
+          if (!existsSync(launcher)) {
+            await ordinaryMessageBox({ type: 'info', title: locale.messages.updateManualDownloadTitle,
+              message: locale.messages.updateManualDownloadTitle,
+              detail: locale.messages.updateManualDownloadDetail,
+              buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+            return
+          }
+          const { spawn } = await import('node:child_process')
+          // Detached: the install chain may close this app; its stdio inherits
+          // the app's (the wrapper terminal) so progress stays visible.
+          // AISHELL_UPGRADE_ACK: the 下载更新 click is the consent to close the
+          // running app; the detached child has no tty, so the interactive ask
+          // would read /dev/tty, fail, and abort the install (field-proven).
+          const child = spawn(launcher, ['upgrade'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'],
+            // Strip AISHELL_FROM_WRAPPER: the wrapper exports it for ITS chain (the wrapper
+            // relaunches the app after its own startup-dialog upgrade, so the chain must not
+            // spawn a second instance). The app INHERITS it from the wrapper that launched it,
+            // and without stripping it here it leaks into app-initiated chains — an upgrade
+            // started from the in-app menu then skipped the relaunch entirely (field-proven:
+            // decline at startup → manual check → 下载更新 → no window after success).
+            env: { ...process.env, AISHELL_UPGRADE_ACK: '1', AISHELL_FROM_WRAPPER: undefined } })
+          child.unref()
+        }
+      }
+    })().catch((error: unknown) => { console.error(error) })
   }
   const commandManager = new DesktopCommandManager({
     resources: process.resourcesPath,
