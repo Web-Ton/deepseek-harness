@@ -4,7 +4,7 @@ import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
 /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
 
 import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises'
-import { createReadStream, existsSync, readFileSync, rmSync } from 'node:fs'
+import { createReadStream, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1515,7 +1515,12 @@ async function main(): Promise<void> {
     { label: currentDesktopLocale().messages.aboutMenu,
       click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } },
     { type: 'separator' },
-    { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
+    // AI Shell distribution (D14 rev5): packaged builds route the item to the
+    // first-party updater (async, off the click path — the ASYNC LAW note on
+    // checkAishellUpdates); dev runs keep the official prompt, stock.
+    { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void (existsSync(join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs'))
+      ? checkAishellUpdates()
+      : openUpdatePrompt(true)) } },
     // AI Shell distribution (aishell command): the upstream "Manage dsh
     // Command…" menu item is removed on every platform — the dist installs
     // the `aishell` command itself (NSIS PATH entry on Windows, install.sh
