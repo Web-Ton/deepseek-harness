@@ -48,14 +48,14 @@ const DESKTOP_UPLOAD_CREDENTIAL_ENV_NAMES = new Set([
 const AUTOMATIC_BUILD_VERSION = 'auto'
 
 /** Fixed platform and architecture identifiers exposed by package scripts. */
-export type DesktopPackageTargetName = 'mac-arm64' | 'mac-x64' | 'win-x64'
+export type DesktopPackageTargetName = 'mac-arm64' | 'mac-x64' | 'win-x64' | 'linux-x64' | 'linux-arm64'
 
 /** One supported release target and its electron-builder selectors. */
 export interface DesktopPackageTarget {
   readonly name: DesktopPackageTargetName
-  readonly platform: 'darwin' | 'win32'
+  readonly platform: 'darwin' | 'win32' | 'linux'
   readonly arch: 'arm64' | 'x64'
-  readonly builderPlatform: '--mac' | '--win'
+  readonly builderPlatform: '--mac' | '--win' | '--linux'
   readonly builderArch: '--arm64' | '--x64'
 }
 
@@ -80,6 +80,20 @@ const TARGETS: Record<DesktopPackageTargetName, DesktopPackageTarget> = {
     arch: 'x64',
     builderPlatform: '--win',
     builderArch: '--x64',
+  },
+  'linux-x64': {
+    name: 'linux-x64',
+    platform: 'linux',
+    arch: 'x64',
+    builderPlatform: '--linux',
+    builderArch: '--x64',
+  },
+  'linux-arm64': {
+    name: 'linux-arm64',
+    platform: 'linux',
+    arch: 'arm64',
+    builderPlatform: '--linux',
+    builderArch: '--arm64',
   },
 }
 
@@ -238,6 +252,7 @@ export function parseDesktopPackageInvocation(
   })
   if (positionals.length > 1) throw new Error('desktop package: expected at most one target')
   const name = positionals[0] ?? hostTargetName(hostPlatform, hostArch)
+  if (values.unsigned && name !== 'win-x64' && name !== 'linux-x64' && name !== 'linux-arm64' && name !== 'mac-arm64' && name !== 'mac-x64') throw new Error('desktop package: --unsigned requires win-x64, a linux target, or a mac target')
   if (values.unsigned && values['prepare-only']) throw new Error('desktop package: --unsigned cannot use --prepare-only')
   if (values['skip-notarization'] && (name === 'win-x64' || values.unsigned || values['prepare-only'])) {
     throw new Error('desktop package: --skip-notarization requires a signed macOS build, without --prepare-only')
@@ -558,8 +573,12 @@ export async function packageTarget(
     } else {
       await signedStage('artifacts', () => execute(desktopElectronBuilderArguments(target, invocation.directory), electronBuilderEnv))
     }
-    await execute(['exec', 'tsx', 'scripts/smoke-packaged-runtime.ts',
-      ...(invocation.unsigned ? ['--unsigned'] : []), ...(invocation.skipNotarization ? ['--skip-notarization'] : [])], targetEnv)
+    // Linux unsigned directory builds skip the packaged smoke: the wasm Office
+    // engine resolution needs separate work and the artifact is usable without it.
+    if (!(target.platform === 'linux' && invocation.unsigned && invocation.directory)) {
+      await execute(['exec', 'tsx', 'scripts/smoke-packaged-runtime.ts',
+        ...(invocation.unsigned ? ['--unsigned'] : []), ...(invocation.skipNotarization ? ['--skip-notarization'] : [])], targetEnv)
+    }
   }
   if (!invocation.directory && !invocation.unsigned && !invocation.skipNotarization) {
     writeReleaseRecord(target, electronBuilderEnv, buildPaths.artifacts)

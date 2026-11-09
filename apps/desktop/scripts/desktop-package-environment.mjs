@@ -29,7 +29,7 @@ const FILE_SETTINGS = ['DSH_DESKTOP_WINDOWS_CER_FILE', 'DSH_DESKTOP_WINDOWS_SIGN
 export function localMacOSPackageEnvironment(environment = process.env) {
   return {
     ...Object.fromEntries(Object.entries(environment).filter(([name]) => !AMBIENT_RELEASE_SETTING.test(name))),
-    DSH_DESKTOP_APP_ID: 'com.deepseek.harness',
+    DSH_DESKTOP_APP_ID: 'com.huaweicloud.aishell',
     DSH_DESKTOP_UNSIGNED: '1',
   }
 }
@@ -59,7 +59,7 @@ export function loadDesktopPackageEnvironment(platform, environment = process.en
     if (!['3', '7'].includes(zipCompression)) throw new Error('desktop package: workflow ZIP compression must be 3 or 7')
   }
   const preset = environment.DSH_PACKAGING_PRESET
-  let path = join(appRoot, platform === 'win32' ? '.env.windows' : '.env.macos')
+  let path = join(appRoot, platform === 'win32' ? '.env.windows' : platform === 'linux' ? '.env.linux' : '.env.macos')
   if (preset !== undefined) {
     if (preset !== 'test' && preset !== 'production') throw new Error('desktop package: preset must be test or production')
     const root = environment.DSH_PACKAGING_CONFIG_DIR

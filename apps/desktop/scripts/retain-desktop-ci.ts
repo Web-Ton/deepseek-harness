@@ -34,6 +34,14 @@ export function desktopReleasesRoot(env: NodeJS.ProcessEnv): string {
  */
 export async function retainDesktopCi(env: NodeJS.ProcessEnv, appRoot = resolve(import.meta.dirname, '..')): Promise<string> {
   const target = resolveDesktopBuildTarget(env)
+  // AI Shell distribution (linux-support): the resolver's type carries the
+  // linux targets this distribution builds; official CI retention only runs
+  // on the three provisioned mac/win runners, so narrow before the store's
+  // schema (linux artifacts ride the distribution's own channel, not the
+  // official retain store).
+  if (target !== 'mac-arm64' && target !== 'mac-x64' && target !== 'win-x64') {
+    throw new Error(`desktop retention: target ${target} has no provisioned CI runner`)
+  }
   const windows = target === 'win-x64'
   const platform = windows ? 'win32' : 'darwin'
   const settings = loadDesktopPackageEnvironment(platform, env, appRoot, { unsigned: true })

@@ -12,10 +12,15 @@ const { values } = parseArgs({ options: { unsigned: { type: 'boolean', default: 
 const target = resolveDesktopBuildTarget()
 const windows = target === 'win-x64'
 const artifacts = desktopArtifactOutput(paths, { unsigned: values.unsigned, skipNotarization: values['skip-notarization'] }).directory
+const linux = target === 'linux-x64' || target === 'linux-arm64'
+if (values.unsigned && !windows && !linux && target !== 'mac-arm64' && target !== 'mac-x64') throw new Error('desktop smoke: unsigned artifacts require Windows, Linux, or macOS')
 const application = windows ? join(artifacts, 'win-unpacked')
-  : join(artifacts, target === 'mac-arm64' ? 'mac-arm64' : 'mac', 'DeepSeek Harness.app', 'Contents')
-const resources = join(application, windows ? 'resources' : 'Resources')
-const executable = windows ? join(application, 'AI Shell.exe') : join(application, 'MacOS', 'AI Shell')
+  : linux ? join(artifacts, 'linux-unpacked')
+    : join(artifacts, target === 'mac-arm64' ? 'mac-arm64' : 'mac', 'AI Shell.app', 'Contents')
+const resources = join(application, windows || linux ? 'resources' : 'Resources')
+const executable = windows ? join(application, 'AI Shell.exe')
+  : linux ? join(artifacts, 'linux-unpacked', '@deepseek-aidsh-desktop')
+    : join(application, 'MacOS', 'AI Shell')
 const descriptor = await verifyDesktopRuntime(paths.dsh, readDesktopRuntime(paths.dsh).release.version,
   resolveDesktopPackageTarget(target))
 if (windows && !values.unsigned) await verifyWindowsCode(application)

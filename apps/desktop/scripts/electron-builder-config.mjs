@@ -64,6 +64,9 @@ export function createElectronBuilderConfig(
     throw new Error('desktop package: DSH_DESKTOP_MACOS_SKIP_NOTARIZATION must be 0 or 1')
   }
   if (skipNotarization && (unsigned || resolvedPlatform !== 'darwin')) throw new Error('Skipping notarization requires a signed macOS build')
+  // AI Shell distribution (linux-support): macOS unsigned internal builds are
+  // a sanctioned lane (ad-hoc identity '-', notarize off), same as win/linux.
+  if (unsigned && resolvedPlatform !== 'win32' && resolvedPlatform !== 'linux' && resolvedPlatform !== 'darwin') throw new Error('desktop package: unsigned builds require Windows, Linux, or macOS')
   const packagesMacOS = targetPlatform === 'darwin' || (targetPlatform === undefined && hostPlatform === 'darwin')
   const packagesWindows = resolvedPlatform === 'win32'
   const policy = packagesMacOS && unsigned ? undefined : resolveDesktopPolicyEnvironment(env)
