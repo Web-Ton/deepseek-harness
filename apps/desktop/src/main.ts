@@ -367,7 +367,9 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
       const messages = currentDesktopLocale().messages
       Menu.buildFromTemplate(items.map(item => ({
         ...item,
-        ...(process.platform === 'win32' && item.role !== undefined && item.role in messages
+        // AI Shell distribution (Linux menu i18n): role labels are localized
+        // on Windows and Linux alike - macOS leaves them to AppKit.
+        ...(process.platform !== 'darwin' && item.role !== undefined && item.role in messages
           ? { label: messages[item.role as keyof typeof messages] } : {}),
         accelerator: '',
       }))).popup({ window })
@@ -1113,7 +1115,7 @@ async function main(): Promise<void> {
     { type: 'separator' },
     ...hideCommands,
     { role: 'quit', ...(darwin ? { label: currentDesktopLocale().messages.quitApplication }
-      : process.platform === 'win32' ? { label: currentDesktopLocale().messages.exitApplication } : {}) },
+      : { label: currentDesktopLocale().messages.exitApplication }) },
   ]
   const devToolsF12Shortcut: MenuItemConstructorOptions = { role: 'toggleDevTools', visible: false, accelerator: 'F12' }
   const windowsDevToolsShortcuts: MenuItemConstructorOptions[] = [

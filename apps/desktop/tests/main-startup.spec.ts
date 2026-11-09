@@ -179,6 +179,9 @@ const harness = await vi.hoisted(async () => {
     getLocale: (): string => 'en-US',
     getPreferredSystemLanguages: () => ['en-US'],
     getVersion: () => '1.0.0',
+    // AI Shell distribution (D8 identity-isolation) calls app.setName at module
+    // top level; the upstream harness predates it.
+    setName: vi.fn(),
     getAppPath: (): string => 'desktop-test-app',
     setAppLogsPath: vi.fn(),
     getPath: vi.fn<(name: string) => string>(),
@@ -486,6 +489,40 @@ describe('desktop main startup', () => {
       nodeBin: packaged ? join('desktop-test-resources', 'runtime', 'bin') : join('desktop-test-app', 'scripts', 'node-bin'),
     })
   })
+
+  it('localizes Linux right-click editing actions after a language switch', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux')
+    await import('../src/main.ts')
+    await harness.preparing.promise
+    const window = harness.windows[0]!
+    const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame }
+    const changed = harness.ipcOn.mock.calls.find(([channel]) => channel === DESKTOP_IPC.localeChanged)![1]
+    const editFlags = { canUndo: true, canRedo: false, canCut: true, canCopy: true, canPaste: true, canSelectAll: true }
+    harness.menu.mockClear()
+    window.webContents.emit('context-menu', {}, { isEditable: true, selectionText: 'text', editFlags })
+    // English before the switch: the substitution gate already applies (the
+    // dictionary is English), unlike darwin where roles stay verbatim.
+    expect(harness.menu.buildFromTemplate).toHaveBeenLastCalledWith([
+      { role: 'undo', enabled: true, label: 'Undo', accelerator: '' }, { role: 'redo', enabled: false, label: 'Redo', accelerator: '' },
+      { type: 'separator', accelerator: '' },
+      { role: 'cut', enabled: true, label: 'Cut', accelerator: '' }, { role: 'copy', enabled: true, label: 'Copy', accelerator: '' },
+      { role: 'paste', enabled: true, label: 'Paste', accelerator: '' }, { type: 'separator', accelerator: '' },
+      { role: 'selectAll', enabled: true, label: 'Select All', accelerator: '' },
+    ])
+    // The web client's locale ids are the bare tags ('zh'/'en') — not 'zh-CN'.
+    changed(event, 'zh')
+    window.webContents.emit('context-menu', {}, { isEditable: true, selectionText: 'text', editFlags })
+    expect(harness.menu.buildFromTemplate).toHaveBeenLastCalledWith([
+      { role: 'undo', enabled: true, label: '撤销', accelerator: '' }, { role: 'redo', enabled: false, label: '重做', accelerator: '' },
+      { type: 'separator', accelerator: '' },
+      { role: 'cut', enabled: true, label: '剪切', accelerator: '' }, { role: 'copy', enabled: true, label: '复制', accelerator: '' },
+      { role: 'paste', enabled: true, label: '粘贴', accelerator: '' }, { type: 'separator', accelerator: '' },
+      { role: 'selectAll', enabled: true, label: '全选', accelerator: '' },
+    ])
+    window.webContents.emit('context-menu', {}, { isEditable: false, selectionText: 'text', editFlags })
+    expect(harness.menu.buildFromTemplate).toHaveBeenLastCalledWith([{ role: 'copy', enabled: true, label: '复制', accelerator: '' }])
+  })
+
 
   it('starts the Host with authentication popups disabled when local settings are invalid', async () => {
     configureTestAuthPopup(false)
