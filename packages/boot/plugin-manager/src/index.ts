@@ -88,6 +88,9 @@ export interface Config {
   detailNpmFileSources?: NpmFileSource[]
 }
 
+/** AI Shell distribution: the preinstalled Huawei Cloud plugin scope - the product itself, not a manageable add-on. */
+const AISHELL_SCOPE = /^@huaweidevtools\//
+
 /** The Fetch route serving images beside bundle detail documents. */
 const DETAIL_FILE_PATH = '/api/plugin-manager/detail-file'
 
@@ -533,7 +536,11 @@ export class PluginManager extends TypertRemoteService {
       const removable = owned || (enabled && !installed && !shipped)
       const sourceOf = (packageName?: string): { source?: string } =>
         owned ? { source: dependencySpec(name, recorded[name] as string, this.profile.dir, packageName) } : {}
-      const readOnlyReason = this.protectsManager(name) ? 'management-required' as const : undefined
+      // AI Shell distribution: the preinstalled plugin scope is the product itself;
+      // its rows read as read-only everywhere the official manager gates a write.
+      const readOnlyReason = (this.protectsManager(name) || AISHELL_SCOPE.test(name))
+        ? 'management-required' as const
+        : undefined
       let availability: BundleInfo['availability'] = 'missing'
       let version: string | undefined
       let listing: Pick<BundleInfo, 'listedByDefault'> = {}
@@ -834,6 +841,11 @@ export class PluginManager extends TypertRemoteService {
     return this.change(result => this.configure(async () => {
       const row = (await this.listPlugins()).find(item => item.entryId === id)
       if (row === undefined) throw new ManagementFailure('unknown-plugin')
+      // AI Shell distribution: the preinstalled plugin scope is the product itself; its rows stay out of
+      // reach for every writer (UI switch, plugin_manager tool) even though they are not in
+      // protectedModules - the bundle rows are namespaced aishell-* by the aggregate patch, deliberately
+      // outside that module-keyed set.
+      if (AISHELL_SCOPE.test(row.moduleName)) throw new ManagementFailure('management-required')
       if (row.readOnlyReason !== undefined) throw new ManagementFailure(row.readOnlyReason)
       await writePluginEnabled(this.profile, row.patchId, row.moduleName, enabled)
       Object.assign(result, await this.reload(enabled ? [row.patchId] : []))
@@ -1047,6 +1059,9 @@ export class PluginManager extends TypertRemoteService {
   removeBundle(name: string): Promise<ChangeResult> {
     return this.change(async (result) => {
       const installed = await this.configure(async () => {
+        // AI Shell distribution: the preinstalled plugin scope is the product itself; removal is refused
+        // before any other logic, so neither the page nor the plugin_manager tool can regress the product.
+        if (AISHELL_SCOPE.test(name)) throw new ManagementFailure('management-required')
         const bundle = (await this.listBundles()).find(item => item.name === name)
         if (bundle === undefined || !bundle.removable) throw new ManagementFailure('not-removable')
         if (this.ownerContext.get('hmr') === undefined && (this.profile.startedBundles.includes(name)

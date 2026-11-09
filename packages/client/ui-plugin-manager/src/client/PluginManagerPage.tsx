@@ -22,6 +22,9 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRenderSlots, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import { EXTENSION_BUNDLES, HIDDEN_BUNDLES, MORE_BUNDLES } from '@deepseek-ai/dsh-official-bundles'
+
+/** AI Shell distribution: the preinstalled Huawei Cloud plugin set is the product itself, not a manageable add-on. */
+const AISHELL_SCOPE = /^@huaweidevtools\//
 import type { createNavigationStore } from './navigation-store.ts'
 import type { PluginHeaderLayoutFace } from './header-scroll.ts'
 import { rowConfigKey, type OfficialItem } from './config-ledger.ts'
@@ -1572,7 +1575,8 @@ export function PluginManagerPage(props: PluginManagerPageProps): ReactNode {
 
   // The page omits profile bundles and persistent terminals. Other installed or offered bundles and
   // unreadable selections remain manageable; Settings' Plugin list inspects the full Host inventory.
-  const listed = state.packages.filter(pkg => !HIDDEN_BUNDLES.has(pkg.name)
+
+const listed = state.packages.filter(pkg => !HIDDEN_BUNDLES.has(pkg.name) && !AISHELL_SCOPE.test(pkg.name)
     && (pkg.listedByDefault !== false || pkg.enabled || pkg.installed || rowsRunning(pkg))
     && (pkg.installed || pkg.official || pkg.error !== undefined))
   const mine = listed.filter(pkg => !pkg.official)
