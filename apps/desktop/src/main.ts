@@ -24,6 +24,7 @@ import {
   type MenuItemConstructorOptions,
 } from 'electron'
 import { resolveDesktopPaths } from './paths.ts'
+import { desktopSessionCookieName } from './desktop-cookie-slim.ts'
 import { DesktopProjectManager } from './project-manager.ts'
 import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
 import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-view.ts'
@@ -199,6 +200,25 @@ interface RuntimeResources {
   readonly node: string
   readonly pnpm: string
   readonly dsh: string
+}
+
+/**
+ * AI Shell distribution (D20 cookie-header slim): remove every dsh-auth-*
+ * cookie for the host EXCEPT the live one — names minted by earlier launches
+ * (each on its own OS-picked random port) are dead weight the official code
+ * never collects. Best-effort: failures log and leave the jar as it was
+ * (the slim callback already ignores foreign names, so correctness never
+ * depends on the sweep).
+ */
+async function desktopSweepSessionCookies(hostUrl: string, liveName: string): Promise<void> {
+  try {
+    const jar = await session.defaultSession.cookies.get({ url: hostUrl })
+    const stale = jar.filter(cookie => cookie.name !== liveName && cookie.name.startsWith('dsh-auth-'))
+    for (const cookie of stale) {
+      await session.defaultSession.cookies.remove(hostUrl, cookie.name).catch(() => { /* best-effort */ })
+    }
+    if (stale.length > 0) console.info(`aishell cookie sweep: removed ${stale.length} stale session cookie(s)`)
+  } catch (error) { console.warn('aishell cookie sweep failed', error) }
 }
 
 function runtimeResources(): RuntimeResources {
@@ -533,7 +553,27 @@ async function main(): Promise<void> {
         hostUrl = ready.url
         if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
         injections = ready.injections
-        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+        // AI Shell distribution (D20 cookie-header slim, 2026-10-23): the
+        // whole-jar join below sent EVERY dsh-auth-* cookie the Electron
+        // session held for this host — and the official cookie name embeds
+        // the hash of host:PORT, while the desktop host binds an OS-picked
+        // RANDOM port, so every launch mints a NEW name and the jar only
+        // accumulates (a test machine reached 71 cookies ≈ 12KB and the
+        // welcome probe died with HTTP 431, misreported as an auth failure).
+        // CLI `dsh web` (fixed ports) keeps the multi-port coexistence the
+        // official naming buys; the DESKTOP talks to exactly one authority,
+        // so it sends exactly that one cookie. The name is derived with the
+        // official cookieName law, replicated here verbatim.
+        const sessionCookieName = desktopSessionCookieName(ready.url)
+        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => {
+          const jar = await session.defaultSession.cookies.get({ url: ready.url })
+          return jar.filter(cookie => cookie.name === sessionCookieName).map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+        })
+        // Launch sweep: clear every OTHER dsh-auth-* leftover for this host —
+        // names minted by earlier launches (random ports) are dead weight the
+        // official code never collects; one pass here heals an accumulated
+        // jar back to a single cookie without waiting 30 days of expiry.
+        void desktopSweepSessionCookies(ready.url, sessionCookieName)
         analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
         if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
         stopAccount?.()

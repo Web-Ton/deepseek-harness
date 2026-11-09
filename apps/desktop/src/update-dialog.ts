@@ -120,7 +120,12 @@ export class DesktopUpdateDialog {
       surface.webContents.on('will-navigate', (event, url) => { if (url !== page) event.preventDefault() })
       surface.webContents.on('will-redirect', (event) => { event.preventDefault() })
       surface.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-      void surface.loadURL(page).catch(failed)
+      // AI Shell distribution (D16 visibility deadline): a page that neither
+      // loads nor fails within 10s would leave an invisible modal swallowing
+      // the parent's input — treat the wait as failed, cancel, unblock.
+      const visibilityDeadline = setTimeout(failed, 10_000)
+      surface.webContents.once('did-finish-load', () => { clearTimeout(visibilityDeadline) })
+      void surface.loadURL(page).catch(() => { clearTimeout(visibilityDeadline); failed() })
     })
   }
 
