@@ -13,9 +13,16 @@ function origin(value, name) {
 /**
  * Resolve mandatory policy metadata before preparing artifacts or accessing signing hardware.
  * @param {NodeJS.ProcessEnv} environment File-owned release settings; the unselected origin is not required.
- * @returns {{ origin: string, allowedPageOrigins: string[], authentication: 'anonymous' | 'feishu-test', [key: string]: unknown }} Selected policy.
+ * @returns {{ origin: string, allowedPageOrigins: string[], authentication: 'anonymous' | 'feishu-test', [key: string]: unknown } | undefined} Selected policy, or undefined when the distribution disables the mandatory-update service.
  */
 export function resolveDesktopPolicyEnvironment(environment) {
+  // AI Shell distribution (D13 mandatory-policy-off): the distribution ships its own
+  // updater (plan A3) and must not bake a mandatory-update policy - any origin baked
+  // here is probed by every installed copy on launch, and the official runtime treats
+  // "policy absent from the packaged manifest" as "policy disabled" (main.ts guards
+  // on the manifest key). The off-switch also releases the origin requirement, so a
+  // distribution build needs no policy origin at all.
+  if (environment.DSH_DESKTOP_MANDATORY_UPDATE_DISABLED === '1') return undefined
   const deployment = resolveDesktopAutoUpdateEnvironment(environment)
   const name = deployment === 'test' ? 'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN' : 'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN'
   const selected = origin(environment[name], name)
