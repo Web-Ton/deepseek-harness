@@ -70,6 +70,9 @@ export interface WelcomeAuthentication {
  * @param authentication - current account and independently stored API-key facts.
  * @returns true only when neither authentication route is configured.
  */
-export function needsWelcome(authentication: WelcomeAuthentication): boolean {
-  return !authentication.loggedIn && !authentication.hasApiKey
+export function needsWelcome(_authentication: WelcomeAuthentication): boolean {
+  // AI Shell distribution: credentials are Huawei Cloud AK/SK configured
+  // in-app by the preinstalled plugins, never through the official account or
+  // API-key flows, so the welcome entry is not needed on any route.
+  return false
 }
