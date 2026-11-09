@@ -36,6 +36,27 @@ Var dshRecoveryStopped
       StrCpy ${RESULT} 0
       ${ExitDo}
     ${EndIf}
+    ; AI Shell (D12 rev4, 2026-10-26): access denied (5) on a rename means
+    ; some process still holds a handle inside the source directory - the
+    ; init-time sweep cannot cover a process started after it, and any
+    ; child image under the dir (runtime, kit, backend) pins the whole
+    ; rename. Reap what holds the source (or its parent, when the source
+    ; itself is the install dir being backed up) and let the loop retry
+    ; before the ten-attempt give-up fires. The upgrade chain is exempt
+    ; by construction on the silent path: it never reaches a rename while
+    ; alive (its exe IS under the dir, but the chain exits as soon as the
+    ; installer's sections complete - this retry only fires on FAILURE,
+    ; where the chain is the party being failed anyway).
+    ${If} ${RESULT} == 5
+      Push $3
+      StrCpy $3 "${SOURCE}"
+      ${If} "${PHASE}" == "backup"
+        StrCpy $3 "$INSTDIR"
+      ${EndIf}
+      System::Call '$PLUGINSDIR\window-frame.dll::InstallerTerminateDirectoryProcesses(w "$3") i.r1 ?c'
+      Pop $3
+      Sleep 500
+    ${EndIf}
     ClearErrors
     FileOpen $2 "$PLUGINSDIR\directory-operations.log" a
     ${IfNot} ${Errors}

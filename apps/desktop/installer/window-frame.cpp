@@ -75,6 +75,41 @@ extern "C" __declspec(dllexport) DWORD __cdecl UninstallRemoveEmptyParents(LPCWS
     return uninstall_data::RemoveEmptyParents(path, stop);
 }
 
+// AI Shell (D12 rev4, 2026-10-26): terminate every process whose image lives
+// under the given directory (the install dir holds more than the main exe -
+// office/python runtimes, libreoffice-kit, orphaned backends - and ANY of
+// them pins the directory rename; found live cutting alpha.40: the running
+// probe found nothing, the backup MoveFileExW still failed with error 5).
+// Returns the count of processes terminated, or -1 if the list cannot be read.
+extern "C" __declspec(dllexport) int __cdecl InstallerTerminateDirectoryProcesses(LPCWSTR directory) {
+    WCHAR expected[32768];
+    DWORD length = GetLongPathNameW(directory, expected, ARRAYSIZE(expected));
+    if (length > 0 && length < ARRAYSIZE(expected)) expected[length] = L'\\', expected[length + 1] = 0;
+    else return -1;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return -1;
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    int terminated = 0;
+    BOOL present = Process32FirstW(snapshot, &entry);
+    while (present) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
+        if (process) {
+            WCHAR path[32768];
+            DWORD count = ARRAYSIZE(path);
+            if (QueryFullProcessImageNameW(process, 0, path, &count)
+                && _wcsnicmp(path, expected, wcslen(expected)) == 0) {
+                if (TerminateProcess(process, 1)) terminated++;
+            }
+            CloseHandle(process);
+        }
+        present = Process32NextW(snapshot, &entry);
+    }
+    if (!present && GetLastError() != ERROR_NO_MORE_FILES) terminated = -1;
+    CloseHandle(snapshot);
+    return terminated;
+}
+
 // Match the affected executable, not another user's or directory's same-named application.
 // Returns 0 while running, 1 when absent, and -1 if the process list cannot be read.
 extern "C" __declspec(dllexport) int __cdecl InstallerFindProcess(LPCWSTR executable) {

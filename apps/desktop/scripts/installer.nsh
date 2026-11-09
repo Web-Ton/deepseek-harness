@@ -2,6 +2,8 @@
 !include "FileFunc.nsh"
 !define INSTALLER_SOURCE_DIR "${__FILEDIR__}\..\installer"
 !define /ifndef INSTALLER_BUILD_DIR "${__FILEDIR__}\..\.desktop-build\targets\win-x64\installer-ui"
+; AI Shell (D12): aishell command PATH registration macros (install + uninstall).
+!include "${INSTALLER_SOURCE_DIR}\aishell-path.nsh"
 
 ManifestDPIAware true
 !ifndef BUILD_UNINSTALLER
@@ -88,6 +90,7 @@ ManifestDPIAware true
 !macroend
 
 !macro customUnInstall
+  !insertmacro un.RemoveAishellCommand
   Call un.CleanData
 !macroend
 
@@ -170,6 +173,26 @@ ManifestDPIAware true
     File "/oname=$PLUGINSDIR\window-frame.dll" "${INSTALLER_BUILD_DIR}\window-frame.dll"
   !endif
   System::Call '$PLUGINSDIR\window-frame.dll::InstallerFindProcess(w "$INSTDIR\${APP_EXECUTABLE_FILENAME}") i.R0 ?c'
+  ; AI Shell (D12 rev2, 2026-10-21): the first-party upgrade chain
+  ; (aishell-upgrade.mjs) runs in ELECTRON_RUN_AS_NODE mode from
+  ; $INSTDIR\AI Shell.exe - its own process is the very exe the call above
+  ; just found (R0==0). Under a silent install (/S) the chain has already
+  ; killed the real GUI app (ACK=1 path: backend.stop + app.quit + taskkill
+  ; residual + 1500ms lock wait, aishell-upgrade.mjs step 5) before spawning
+  ; this installer, so any AI Shell.exe still alive IS the chain itself.
+  ; Letting the probe stand would loop 40*250ms waiting for the chain to
+  ; exit (it won't - it's waiting for THIS installer), then SetErrorLevel 2
+  ; + Quit -> the exit-2 halt that left the staged setup.exe un-deleted.
+  ; Override R0 to "not found" (InstallerFindProcess: 0=found, >0=not-found,
+  ; <0=error) so every branch below falls through and the install proceeds.
+  ; NOTE: gated on ${Silent} alone (not isUpdated) - electron-builder's NSIS
+  ; template never injects a !define for isUpdated, so ${isUpdated} resolves
+  ; to an empty/false condition and the original gate never fired. A silent
+  ; install is unambiguously the upgrade-chain path (a user double-clicking
+  ; setup.exe runs interactive, never /S).
+  ${If} ${Silent}
+    StrCpy $R0 1
+  ${EndIf}
   ${If} $R0 == 0
     ${If} ${isUpdated}
       StrCpy $R1 0
@@ -192,6 +215,37 @@ ManifestDPIAware true
     MessageBox MB_OK|MB_ICONEXCLAMATION "$(INSTALLER_UI_ERROR)" /SD IDOK
     SetErrorLevel 2
     Quit
+  ${EndIf}
+  ; AI Shell (D12 rev4, 2026-10-26): the running probe only watches
+  ; AI Shell.exe, but the install dir hosts further long-lived images
+  ; (office/python runtimes, libreoffice-kit, orphaned backends), and
+  ; ANY process under $INSTDIR pins the directory backup rename in
+  ; dshPromoteDirectories -> MoveFileExW fails with error 5 after ten
+  ; retries and the interactive install dies mid-swap (field report
+  ; cutting alpha.40: probe green, swap red). Sweep the directory and
+  ; terminate what the probe cannot see. INTERACTIVE ONLY: under /S
+  ; the upgrade chain itself runs from $INSTDIR\AI Shell.exe waiting
+  ; for THIS installer (the rev2 case) and must not be reaped - and
+  ; the chain already killed the real app tree in its step 5, so a
+  ; silent install never carries stragglers to begin with. Reaching
+  ; here interactive means the main exe is not running (the probe
+  ; above already halted that case), so the sweep only reaps headless
+  ; leftovers of an app that is gone - no consent dialog owed. Bounded
+  ; retry (40x250ms, the probe loop's own budget): children need a
+  ; moment to release handles after TerminateProcess before the swap.
+  ${IfNot} ${Silent}
+    StrCpy $R1 0
+    ${DoWhile} $R1 < 40
+      System::Call '$PLUGINSDIR\window-frame.dll::InstallerTerminateDirectoryProcesses(w "$INSTDIR") i.R0 ?c'
+      ${If} $R0 <= 0
+        ${ExitDo}
+      ${EndIf}
+      ${If} $R1 == 0
+        DetailPrint "AI Shell: terminated $R0 process(es) under $INSTDIR before install"
+      ${EndIf}
+      Sleep 250
+      IntOp $R1 $R1 + 1
+    ${Loop}
   ${EndIf}
 !macroend
 
@@ -240,6 +294,8 @@ ManifestDPIAware true
   !insertmacro dshFinishDirectories
   ; Standard uninstall-entry metadata read by inventory tools; the upstream template records it only under its private key.
   WriteRegStr SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" InstallLocation "$INSTDIR"
+  ; AI Shell (D12): register the aishell command on the user PATH.
+  !insertmacro InstallAishellCommand
   ${If} $0 == 1
     SetErrors
   ${Else}

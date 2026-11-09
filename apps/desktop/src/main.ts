@@ -1187,8 +1187,12 @@ async function main(): Promise<void> {
       : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
     { type: 'separator' },
     { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
-    ...process.platform === 'darwin' || process.platform === 'win32'
-      ? [{ label: currentDesktopLocale().messages.cliCommandMenu, click: () => { void commandManager.show() } }] : [],
+    // AI Shell distribution (aishell command): the upstream "Manage dsh
+    // Command…" menu item is removed on every platform — the dist installs
+    // the `aishell` command itself (NSIS PATH entry on Windows, install.sh
+    // symlink on Linux and macOS) and never routes through the upstream
+    // command-manager, whose macOS contract manages `dsh` for the official
+    // desktop. The manager instance stays wired for update coordination.
     { type: 'separator' },
     ...development ? [
       { label: currentDesktopLocale().messages.reloadPageMenu, role: 'reload' as const },
