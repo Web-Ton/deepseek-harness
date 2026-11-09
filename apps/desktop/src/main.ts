@@ -38,6 +38,7 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
 import { claimDesktopSingleInstance } from './single-instance.ts'
 import { desktopUpdateChannel } from './update-channel.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+import { AishellUpdateBridge, aishellPlatform } from './aishell-update-bridge.ts'
 import { prepareDesktopUpdateWindow } from './update-window.ts'
 import { DesktopCommandManager } from './command-management.ts'
 import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
@@ -690,6 +691,75 @@ async function main(): Promise<void> {
     return state
   }
 
+  // AI Shell distribution (D19 settings-update-button): the bridge drives
+  // the official web indicator from the first-party updater on Linux
+  // packaged runs. It publishes through publishUpdate (single-writer: the
+  // official coordinator stays idle — this distribution ships no
+  // app-update.yml), guards busy/once installations on the main-process
+  // side, restores the ready phase from a persisted staging, and is
+  // fail-open by construction (a bridge defect hides the button, never
+  // kills the app). Win/mac keep the D14 menu flow; dev runs stay stock.
+  let updateBridge: AishellUpdateBridge | undefined
+  if (process.platform === 'linux' && app.isPackaged
+    && existsSync(join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs'))) {
+    try {
+      updateBridge = new AishellUpdateBridge(publishUpdate, aishellPlatform(process.resourcesPath, process.execPath),
+        true, 10 * 60_000, async (version: string) => {
+          // The official ready confirmation (official copy, official dialog):
+          // 安装并重启 is the ONLY acceptance; the cancelId is a nonexistent
+          // index, so X/Esc/replacement can never read as consent.
+          const ready = desktopUpdateReadyConfirmation(locale.messages, version, process.platform)
+          const parent = currentDialogWindow()
+          if (parent === undefined) return false
+          const result = await updateDialog.show(parent, {
+            type: 'info', title: locale.messages.updateTitle,
+            message: ready.message, detail: ready.detail,
+            buttons: [locale.messages.installAndRestart], defaultId: 1, cancelId: 1,
+          })
+          return result.response === 0
+        })
+      // Startup pass: a check immediately (fresh info for the button), then
+      // staging recovery against whatever the check learned.
+      void updateBridge.backgroundCheck().then(async () => {
+        const bridge = updateBridge
+        if (bridge === undefined) return
+        await bridge.resume(candidate => {
+          const state = bridge.status
+          return state.phase === 'available' && state.version !== undefined
+            && compareAishellVersions(state.version, candidate) > 0
+        })
+      }).catch((error: unknown) => { console.error(error) })
+      console.info('aishell update bridge: active (10-minute cadence, startup check)')
+    } catch (error) { console.error('aishell update bridge: disabled (init failure)', error) }
+  }
+  /** Semver precedence for the resume gate; 0 when unparseable (treated as unknown → resume declines). */
+  function compareAishellVersions(a: string, b: string): number {
+    const pa = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(a)
+    const pb = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(b)
+    if (pa === null || pb === null) return 0
+    for (let i = 1; i <= 3; i++) {
+      const x = Number(pa[i]), y = Number(pb[i])
+      if (x !== y) return x < y ? -1 : 1
+    }
+    const ra = pa[4] === undefined ? [] : pa[4].split('.')
+    const rb = pb[4] === undefined ? [] : pb[4].split('.')
+    if (ra.length === 0 && rb.length === 0) return 0
+    if (ra.length === 0) return 1
+    if (rb.length === 0) return -1
+    for (let i = 0; i < Math.max(ra.length, rb.length); i++) {
+      const x = ra[i], y = rb[i]
+      if (x === undefined) return -1
+      if (y === undefined) return 1
+      if (x === y) continue
+      const xn = /^-?\d+$/.test(x), yn = /^-?\d+$/.test(y)
+      if (xn && yn) return Number(x) < Number(y) ? -1 : 1
+      if (xn) return -1
+      if (yn) return 1
+      return x < y ? -1 : 1
+    }
+    return 0
+  }
+
   const readWelcomeState = async () => {
     if (backend.host === undefined || welcomeBackend === undefined) throw new Error('desktop welcome: backend unavailable')
     return welcomeBackend.read()
@@ -911,7 +981,10 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.updatesStatus, (event) => {
     assertProductSender(event)
-    return presentDesktopUpdate(updates.state)
+    // AI Shell distribution (D19 settings-update-button): the bridge owns
+    // the state on Linux packaged runs — the web indicator queries THIS,
+    // not the inert electron-updater coordinator (no app-update.yml here).
+    return presentDesktopUpdate(updateBridge !== undefined ? updateBridge.status : updates.state)
   })
   ipcMain.handle(DESKTOP_IPC.deviceInfo, (event) => {
     assertProductSender(event)
@@ -934,6 +1007,14 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.updatesOpen, async (event) => {
     assertProductSender(event)
+    // AI Shell distribution (D19 settings-update-button): on Linux packaged
+    // runs the button drives the bridge (official semantics: available ->
+    // download with inline progress -> ready -> confirmation). Other packaged
+    // platforms keep the D14 menu-dialog flow; dev runs stay stock.
+    if (updateBridge !== undefined) {
+      updateBridge.open()
+      return
+    }
     await openUpdatePrompt()
   })
 
@@ -1060,10 +1141,16 @@ async function main(): Promise<void> {
 
   const automaticCheck = (): void => {
     if (!quitting) void mandatoryPolicy?.check('foreground-or-resume').catch((error: unknown) => { console.error(error) })
-    if (!quitting) void updateSchedule.check().catch((error: unknown) => { console.error(error) })
+    // AI Shell distribution (D19): the bridge owns the ordinary polling on
+    // Linux packaged runs — the official coordinator would publish a
+    // no-packaged-source error on every tick and the button would flip to
+    // retry. Single-writer law.
+    if (!quitting && updateBridge === undefined) void updateSchedule.check().catch((error: unknown) => { console.error(error) })
+    if (!quitting && updateBridge !== undefined) void updateBridge.backgroundCheck().catch((error: unknown) => { console.error(error) })
   }
   powerMonitor.on('resume', automaticCheck)
   app.on('will-quit', () => {
+    updateBridge?.dispose()
     updateSchedule.dispose()
     powerMonitor.off('resume', automaticCheck)
     updates.dispose()
@@ -1217,8 +1304,16 @@ async function main(): Promise<void> {
     shortcuts.attach(window)
     window.on('focus', automaticCheck)
     // Closing hides: the page and the Host keep running, and the next show resumes the same document.
+    // AI Shell distribution (D17): on Linux, closing the window exits — the
+    // official close-to-background design has no return channel there (the
+    // tray and the background notice are win32-only, the Dock is darwin-only),
+    // so a hidden window read as a dead window with resident processes. The
+    // quit routes through the application's own quit chain, so the task
+    // confirmation (active or scheduled work) still asks before stopping.
+    // Windows and macOS keep the official semantics unchanged.
     window.on('close', (event) => {
       if (quitting || shellInstallerOwnsQuit || sessionEnding) return
+      if (process.platform === 'linux') { app.quit(); return }
       event.preventDefault()
       if (updateDialog.isOpen) { updateDialog.focus(); return }
       const hide = (): void => {
@@ -1484,6 +1579,10 @@ async function main(): Promise<void> {
   if (window !== undefined && development && process.env.DSH_DESKTOP_OPEN_DEVTOOLS !== '0') {
     window.webContents.openDevTools({ mode: 'detach' })
   }
+  // AI Shell distribution (D19): with the bridge active, the bridge state
+  // IS the update state - republish it so late-attaching windows see the
+  // startup check's verdict rather than a stale idle.
+  if (updateBridge !== undefined) publishUpdate(updateBridge.status)
   publishUpdate(updateState)
 }
 
