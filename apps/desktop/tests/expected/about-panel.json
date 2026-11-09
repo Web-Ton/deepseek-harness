@@ -1,8 +1,12 @@
 {
   "darwin:en-US": {
     "menu": [
-      { "label": "About AI Shell", "role": "about" },
-      { "type": "separator" }
+      {
+        "label": "About AI Shell"
+      },
+      {
+        "type": "separator"
+      }
     ],
     "options": {
       "applicationName": "AI Shell",
@@ -14,8 +18,12 @@
   },
   "darwin:zh-CN": {
     "menu": [
-      { "label": "关于 AI Shell", "role": "about" },
-      { "type": "separator" }
+      {
+        "label": "关于 AI Shell"
+      },
+      {
+        "type": "separator"
+      }
     ],
     "options": {
       "applicationName": "AI Shell",
@@ -27,8 +35,12 @@
   },
   "win32:zh-CN": {
     "menu": [
-      { "label": "关于 AI Shell" },
-      { "type": "separator" }
+      {
+        "label": "关于 AI Shell"
+      },
+      {
+        "type": "separator"
+      }
     ],
     "options": {
       "applicationName": "AI Shell",
@@ -40,8 +52,12 @@
   },
   "win32:en-US": {
     "menu": [
-      { "label": "About AI Shell" },
-      { "type": "separator" }
+      {
+        "label": "About AI Shell"
+      },
+      {
+        "type": "separator"
+      }
     ],
     "options": {
       "applicationName": "AI Shell",
