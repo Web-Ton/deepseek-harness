@@ -17,11 +17,23 @@ afterEach(() => {
   send.mockClear()
 })
 
-it.each(['darwin', 'linux'] as const)('does not install Windows controls on %s', (platform) => {
-  vi.spyOn(process, 'platform', 'get').mockReturnValue(platform)
+it('does not install Windows controls on darwin', () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
   syncWindowsAppearance()
   expect(document.documentElement.hasAttribute('data-windows-titlebar')).toBe(false)
   expect(send).not.toHaveBeenCalled()
+})
+
+// AI Shell distribution (Linux chrome theme): Linux draws its own caption
+// like win32, so the controls install there too — observed at call time.
+// The install itself stays deferred (loading document) so the case asserts
+// the mark without the canvas-dependent observer wiring.
+it('installs Windows controls on linux', () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('linux')
+  vi.spyOn(document, 'readyState', 'get').mockReturnValue('loading')
+  syncWindowsAppearance()
+  expect(document.documentElement.hasAttribute('data-windows-titlebar')).toBe(true)
+  window.dispatchEvent(new Event('DOMContentLoaded'))
 })
 
 it('synchronizes live language and palette changes and stops observing a closed document', async () => {

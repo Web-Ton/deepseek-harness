@@ -1,6 +1,6 @@
 import { installFileActions } from './file-actions.ts'
 import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
-import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
+import { WINDOWS_TITLEBAR_HEIGHT, selfDrawnChrome } from './windows-layout.ts'
 /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
 
 import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises'
@@ -286,7 +286,7 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     minWidth: 520,
     minHeight: 600,
     show,
-    ...(process.platform === 'win32' && primary ? {
+    ...(selfDrawnChrome() && primary ? {
       titleBarStyle: 'hidden' as const,
       titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT, color: chromeFallbackFill(),
         symbolColor: nativeTheme.shouldUseDarkColors ? '#f9fafb' : '#0f1115' },
@@ -520,7 +520,7 @@ async function main(): Promise<void> {
   // AI Shell distribution (D15, changelog task 2026-10-22): the optional
   // feed changelog rides the check result; display-only, absent key = no
   // block (one window one language — never the other language).
-  type AishellCheckResult = { update: { version: string, artifactUrl?: string, sha256?: string, changelog?: { en?: string, zh?: string } } | null, version: string, error: string | null }
+  type AishellCheckResult = { update: { version: string; artifactUrl?: string; sha256?: string; changelog?: { en?: string; zh?: string } } | null; version: string; error: string | null }
   // One spawn handle per helper, passed (not re-imported): two concurrent
   // dynamic imports of the same mocked builtin race in the module runner —
   // the loser resolves the NATIVE module and escapes the test double
@@ -1052,7 +1052,7 @@ async function main(): Promise<void> {
       void updateBridge.backgroundCheck().then(async () => {
         const bridge = updateBridge
         if (bridge === undefined) return
-        await bridge.resume(candidate => {
+        await bridge.resume((candidate) => {
           const state = bridge.status
           return state.phase === 'available' && state.version !== undefined
             && compareAishellVersions(state.version, candidate) > 0
@@ -1555,7 +1555,7 @@ async function main(): Promise<void> {
     devToolsF12Shortcut,
   ]
   const refreshApplicationMenu = (): void => {
-    Menu.setApplicationMenu(Menu.buildFromTemplate(process.platform === 'win32'
+    Menu.setApplicationMenu(Menu.buildFromTemplate(selfDrawnChrome()
       ? windowsDevToolsShortcuts : [{
         label: darwin ? app.name : currentDesktopLocale().messages.application,
         submenu: [...applicationItems(), devToolsF12Shortcut],
@@ -1588,7 +1588,7 @@ async function main(): Promise<void> {
     ...(process.platform === 'win32' ? { icon: nativeImage.createFromPath(trayIconPath) } : {}),
   })
 
-  if (process.platform === 'win32') {
+  if (selfDrawnChrome()) {
     ipcMain.handle(DESKTOP_IPC.windowsMenu, (event, name: unknown, x: unknown, y: unknown) => {
       assertDesktopSender(event, ['app'])
       if (mainWindow === undefined || event.sender !== mainWindow.webContents

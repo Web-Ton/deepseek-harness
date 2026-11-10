@@ -23,8 +23,8 @@ type InvokeHandler = (event: InvokeEvent, ...args: unknown[]) => unknown
 const fileDrag = vi.hoisted(() => ({ dispose: vi.fn<() => Promise<void>>(), install: vi.fn() }))
 
 const aishellSpawn = vi.hoisted(() => ({
-  handler: undefined as ((file: string, args: string[]) => { stdout?: string, code?: number, write?: string } | undefined) | undefined,
-  calls: [] as Array<{ file: string, args: string[], options: unknown }>,
+  handler: undefined as ((file: string, args: string[]) => { stdout?: string; code?: number; write?: string } | undefined) | undefined,
+  calls: [] as Array<{ file: string; args: string[]; options: unknown }>,
 }))
 
 vi.mock('../src/file-drag.ts', () => ({ installDesktopFileDrag: () => { fileDrag.install(); return fileDrag.dispose } }))
@@ -309,7 +309,7 @@ vi.mock('../src/policy-test-auth.ts', () => ({ DesktopPolicyTestAuth: class {
   readonly request: typeof fetch = (input, init) => fetch(input, init)
 } }))
 
-vi.mock('node:child_process', async importOriginal => {
+vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
   const { EventEmitter } = await import('node:events')
   const { writeFileSync } = await import('node:fs')
@@ -338,12 +338,12 @@ vi.mock('node:child_process', async importOriginal => {
     return child
   }) }
 })
-  aishellSpawn.handler = undefined
-  aishellSpawn.calls = []
-  // AI Shell distribution (D15 rev13): the macOS menu upgrade runs in the
-  // app — pinned re-check, resumable download, streamed verify, detached
-  // darwin-install handoff, consent-clean quit. The children are scripted
-  // (aishellSpawn); no curl/osascript ever reaches the OS.
+aishellSpawn.handler = undefined
+aishellSpawn.calls = []
+// AI Shell distribution (D15 rev13): the macOS menu upgrade runs in the
+// app — pinned re-check, resumable download, streamed verify, detached
+// darwin-install handoff, consent-clean quit. The children are scripted
+// (aishellSpawn); no curl/osascript ever reaches the OS.
 
 
 
@@ -654,7 +654,10 @@ describe('desktop main startup', () => {
     expect(visible.filter(item => item.role === 'toggleDevTools')).toEqual([
       { role: 'toggleDevTools', label: messages.toggleDevToolsMenu },
     ])
-    if (platform === 'win32') {
+    // AI Shell distribution (Linux chrome theme): Linux draws its own caption
+    // like win32 — the application menu collapses to hidden shortcuts and the
+    // localized DevTools item lives in the caption's popup template.
+    if (platform !== 'darwin') {
       expect(harness.menu.mock.calls[0]![0]).toEqual([
         { role: 'toggleDevTools', visible: false },
         { role: 'toggleDevTools', visible: false, accelerator: 'F12' },
@@ -670,8 +673,9 @@ describe('desktop main startup', () => {
     harness.ipcOn.mock.calls.find(([channel]) => channel === DESKTOP_IPC.localeChanged)![1](
       { sender, senderFrame: sender.mainFrame }, nextLocale,
     )
-    const refreshed = platform === 'win32' ? applicationMenuItems()
-      : harness.menu.mock.lastCall![0][0]!.submenu as MenuItemConstructorOptions[]
+    const refreshed = platform === 'darwin'
+      ? harness.menu.mock.lastCall![0][0]!.submenu as MenuItemConstructorOptions[]
+      : applicationMenuItems()
     expect(refreshed.filter(item => item.role === 'toggleDevTools' && item.visible !== false)).toEqual([
       { role: 'toggleDevTools', label: nextLocale === 'en' ? en.toggleDevToolsMenu : zh.toggleDevToolsMenu },
     ])
@@ -789,7 +793,7 @@ describe('desktop main startup', () => {
       artifactUrl: 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg', sha256 })
     const resources = await bootAishellMenu(feed)
     let handedOff!: (installArgs: string[]) => void
-    const handoff = new Promise<string[]>(resolve => { handedOff = resolve })
+    const handoff = new Promise<string[]>((resolve) => { handedOff = resolve })
     aishellSpawn.handler = (file, args) => {
       if (args.includes('darwin-install')) { handedOff(args); return {} }
       if (args.includes('check')) return { stdout: feed }
@@ -847,8 +851,8 @@ describe('desktop main startup', () => {
       artifactUrl: 'http://standin.example/pkg/latest/ai-shell-mac-x64.dmg', sha256: wrongSha })
     await bootAishellMenu(feed)
     let failed!: (detail: unknown) => void
-    const failureShown = new Promise<unknown>(resolve => { failed = resolve })
-    harness.dialog.showMessageBox.mockImplementation((options: { type?: string, technicalDetails?: string }) => {
+    const failureShown = new Promise<unknown>((resolve) => { failed = resolve })
+    harness.dialog.showMessageBox.mockImplementation((options: { type?: string; technicalDetails?: string }) => {
       if (options.type === 'warning') failed(options.technicalDetails)
       return Promise.resolve({ response: 0 })
     })
@@ -874,7 +878,7 @@ describe('desktop main startup', () => {
       artifactUrl: 'http://standin.example/pkg/latest/ai-shell-win-x64.tar.gz', sha256: 'a'.repeat(64) })
     await bootAishellMenu(feed, 'win32')
     let shown!: () => void
-    const manualShown = new Promise<void>(resolve => { shown = () => resolve() })
+    const manualShown = new Promise<void>((resolve) => { shown = () => resolve() })
     harness.dialog.showMessageBox.mockImplementation((options: { message?: string }) => {
       if (options.message === en.updateManualDownloadTitle) shown()
       return Promise.resolve({ response: 0 })
@@ -905,9 +909,9 @@ describe('desktop main startup', () => {
       getLanguages.mockRestore()
     }
     let captured!: () => void
-    const dialogShown = new Promise<void>(resolve => { captured = () => resolve() })
+    const dialogShown = new Promise<void>((resolve) => { captured = () => resolve() })
     let detail: string | undefined
-    harness.dialog.showMessageBox.mockImplementation((options: { message?: string, detail?: string }) => {
+    harness.dialog.showMessageBox.mockImplementation((options: { message?: string; detail?: string }) => {
       detail = options.detail
       captured()
       return Promise.resolve({ response: 1 })
@@ -1165,16 +1169,16 @@ describe('desktop main startup', () => {
     expect(window.urls).toEqual(['dsh-app://app/'])
     if (platform === 'darwin') {
       expect(window.options).toMatchObject({ titleBarStyle: 'hiddenInset', vibrancy: 'sidebar', backgroundColor: '#00000000' })
-    } else if (platform === 'win32') {
+    } else {
+      // AI Shell distribution (Linux chrome theme): win32 and Linux alike
+      // draw their own caption — hidden native titlebar + Window Controls
+      // Overlay — and the application menu collapses to hidden shortcuts.
       expect(window.options).toMatchObject({ titleBarStyle: 'hidden', titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT } })
       expect(window.options).not.toHaveProperty('vibrancy')
       expect(harness.menu.mock.calls[0]![0]).toEqual([
         { role: 'toggleDevTools', visible: false },
         { role: 'toggleDevTools', visible: false, accelerator: 'F12' },
       ])
-    } else {
-      expect(window.options).not.toHaveProperty('titleBarStyle')
-      expect(window.options).not.toHaveProperty('vibrancy')
     }
     expect(harness.hosts).toHaveLength(0)
   })
@@ -1357,7 +1361,10 @@ describe('desktop main startup', () => {
     await edit
   })
 
-  it.each(['darwin', 'linux'] as const)('adds the product File menu and standard window commands only on macOS (%s)', async (platform) => {
+  it.each(['darwin'] as const)('adds the product File menu and standard window commands only on macOS (%s)', async (platform) => {
+    // AI Shell distribution (Linux chrome theme): on Linux the caption is
+    // self-drawn and the application menu collapses to hidden shortcuts —
+    // the ['Application', 'editMenu'] menu-bar shape exists on macOS only.
     vi.spyOn(process, 'platform', 'get').mockReturnValue(platform)
     await import('../src/main.ts')
     await harness.preparing.promise
