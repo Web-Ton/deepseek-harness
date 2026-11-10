@@ -1182,6 +1182,12 @@ export class PluginManager extends TypertRemoteService {
   }
 
   private async selectBundle(name: string, enabled: boolean): Promise<void> {
+    // AI Shell distribution: the preinstalled plugin scope is the product itself;
+    // selection changes are refused in both directions. This one guard covers
+    // setBundleEnabled (either way), removeBundle's deselect step, and
+    // installBundle's activation step, with the same refusal semantics the
+    // manager's other gates use.
+    if (AISHELL_SCOPE.test(name)) throw new ManagementFailure('management-required')
     const manifest = readProfileManifest('dsh', this.profile.dir)
     const previous = bundleSelection(manifest)
     if (enabled || !previous.includes(name)) {
