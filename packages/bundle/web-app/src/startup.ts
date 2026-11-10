@@ -37,6 +37,8 @@ export interface WebStartupValues {
   publicUrl?: string
   /** Explicit `--trusted-host` authorities, in argument order. */
   trustedHosts: string[]
+  /** AI Shell distribution: `--proxy-auth` short-circuits cookie auth and the /api browser fence for a Set-Cookie-stripping reverse proxy. */
+  proxyAuth: boolean
   /** Server certificate chain and unencrypted private key supplied together. */
   tls?: TlsConfig
 }
@@ -50,6 +52,7 @@ interface WebOptions {
   trustedHost?: string[]
   tlsCert?: string
   tlsKey?: string
+  proxyAuth?: boolean
 }
 
 /**
@@ -66,6 +69,7 @@ function webCommand(): Command {
     .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
     .option('--public-url <url>', 'advertise this HTTP(S) root in the printed, opened, runtime-context, and DSH_WEB_URL forms; grants no trust')
     .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
+    .option('--proxy-auth', 'AI Shell distribution: skip cookie auth and the /api browser fence for a Set-Cookie-stripping reverse proxy (e.g. a workspace port forwarder); --trusted-host still required')
     .option('--tls-cert <file>', 'PEM server certificate chain; requires --tls-key')
     .option('--tls-key <file>', 'unencrypted PEM private key; requires --tls-cert')
     .addHelpText('after', `
@@ -118,6 +122,7 @@ export function apply(ctx: Context): void {
       ...options.publicUrl !== undefined && { publicUrl: options.publicUrl },
       ...tls !== undefined && { tls },
       trustedHosts: options.trustedHost ?? [],
+      proxyAuth: options.proxyAuth === true,
     } satisfies WebStartupValues)
   })
   parseCmdline(ctx, program)

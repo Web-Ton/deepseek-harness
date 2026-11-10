@@ -107,6 +107,15 @@ export interface ConnectionConfig {
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /**
+   * AI Shell distribution: short-circuit cookie auth and the /api browser
+   * fence for a Set-Cookie-stripping reverse proxy (e.g. a workspace port
+   * forwarder). The Host/trustedHosts fence still binds requests, so
+   * `--trusted-host` remains required; only cookie issuance/verification and
+   * the Sec-Fetch-Site/Origin checks are bypassed. Default: false (no change
+   * to the official auth model).
+   */
+  proxyAuth?: boolean
 }
 
 export const Config: z<ConnectionConfig> = z.object({
@@ -114,6 +123,7 @@ export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  proxyAuth: z.boolean().default(false),
 })
 
 /**
@@ -129,6 +139,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const trustedHosts = config?.trustedHosts ?? []
   const cookieMaxAgeDays = config?.cookieMaxAgeDays ?? 30
   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+  const proxyAuth = config?.proxyAuth ?? false
   // Config boundary: a malformed entry fails the load loudly here rather than
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
@@ -136,12 +147,14 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   const connection = new HostConnectionService(
     ctx,
     trustedHosts,
-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays, proxyAuth),
+    proxyAuth,
   )
   ctx.inject(['webServer'], (webCtx) => {
     assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
     webCtx.on('webserver/index-inject', (table) => {
       table.push({ kind: 'global', name: '__DSH_CONNECTION_RECOVERY__', value: recovery })
+      if (proxyAuth) table.push({ kind: 'global', name: '__DSH_PROXY_AUTH__', value: true })
     })
     const fetchHandler = connection.createSharedFetchHandler(API_PATH)
     const route: WebRoute = {

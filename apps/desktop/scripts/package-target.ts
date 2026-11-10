@@ -1,9 +1,9 @@
 /** Build one release target with matching Electron and dsh architecture. */
 
 import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { parseArgs } from 'node:util'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import {
   desktopBuildRecordFilename,
   resolveDesktopAutoUpdateConfig,
@@ -309,9 +309,36 @@ function runPnpm(
   cwd: string = APP_ROOT,
   run?: ReturnType<typeof createPackagingRun>,
 ): Promise<void> {
-  const pnpmEntry = process.env.npm_execpath
+  let pnpmEntry = process.env.npm_execpath
   if (pnpmEntry === undefined || pnpmEntry === '') {
     throw new Error('desktop package: invoke this script through a pnpm package command')
+  }
+  // Windows: pnpm.cmd sets npm_execpath to pnpm.exe (a native binary from
+  // @pnpm/exe). spawn(node, [pnpm.exe, ...]) fails with ERR_UNKNOWN_FILE_EXTENSION
+  // — node's ESM loader cannot load a .exe. pnpm itself re-sets npm_execpath in
+  // its child, so the env var the builder sets is overwritten before this code
+  // runs. Fix it here: when the entry is a .exe, substitute the JS entry
+  // (bin/pnpm.mjs) that sits next to node — node can load it as ESM.
+  if (process.platform === 'win32' && pnpmEntry.endsWith('.exe')) {
+    // The .exe's own install keeps a loadable JS entry beside it: @pnpm/exe's
+    // store layout ships dist/pnpm.mjs next to pnpm.exe (same version, same
+    // behavior). Prefer that — the exact pnpm that is running this script —
+    // before falling back to the Node install's bundled copy (the 2026-10-22
+    // first win-x64 release found machines where the bundle does not exist).
+    const mjsCandidates = [
+      join(dirname(pnpmEntry), 'dist', 'pnpm.mjs'),
+      join(dirname(pnpmEntry), 'pnpm.mjs'),
+      join(dirname(process.execPath), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'),
+    ]
+    const mjsEntry = mjsCandidates.find(c => existsSync(c))
+    if (mjsEntry !== undefined) pnpmEntry = mjsEntry
+  }
+  // Linux: @pnpm/exe ships an ELF binary as the pnpm entry; node cannot
+  // import an ELF file as ESM. Substitute the JS entry (bin/pnpm.mjs) from
+  // the global pnpm install — node can load it as ESM.
+  if (process.platform === 'linux' && !pnpmEntry.endsWith('.mjs') && !pnpmEntry.endsWith('.js') && !pnpmEntry.endsWith('.cjs')) {
+    const mjsEntry = join(dirname(dirname(process.execPath)), 'lib', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
+    if (existsSync(mjsEntry)) pnpmEntry = mjsEntry
   }
   if (run !== undefined) return run.run(args.join(' '), process.execPath, [pnpmEntry, ...args], { cwd, env })
   return new Promise((resolvePromise, reject) => {

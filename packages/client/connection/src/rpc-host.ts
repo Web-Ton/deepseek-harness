@@ -83,11 +83,13 @@ export class HostConnectionService extends Service implements HostConnectionHand
    * @param ctx - owning Connection plugin context.
    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
    * @param browserAuth - process token and persistent browser-session owner.
+   * @param proxyAuth - AI Shell distribution: short-circuit cookie auth and the browser fence for a Set-Cookie-stripping proxy.
    */
   constructor(
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    private readonly proxyAuth: boolean = false,
   ) {
     super(ctx, 'connection')
     this.owner = ctx
@@ -163,7 +165,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   private isTrusted(request: ConnectionTrustRequest): boolean {
     const carrier = this.owner.get('webServer')
-    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:')
+    return isTrustedApiRequest(request, this.trustedHosts, carrier?.host, carrier?.protocol ?? 'http:', this.proxyAuth)
   }
 
   private publishPeer(interactions: ConnectionInteractions): PeerId {

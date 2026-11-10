@@ -123,6 +123,8 @@ export interface ClientTransportHooks {
 interface ClientTransportGlobal {
   __DSH_TRANSPORT__?: ClientTransportHooks
   __DSH_CONNECTION_RECOVERY__?: unknown
+  /** AI Shell distribution: injected when the Host runs with proxyAuth, so a non-loopback page behind a Set-Cookie-stripping proxy still reads as the privileged surface. */
+  __DSH_PROXY_AUTH__?: boolean
 }
 
 /** Browser location fields used to classify loopback authority. */
@@ -271,7 +273,7 @@ export function installConnection(ctx: Context, options: ConnectionInstallOption
   const handle: ConnectionHandle = {
     interactions,
     openWebSocket: path => openConnectionWebSocket(path, transport?.createWebSocket, transport?.streamBaseUrl),
-    isLoopback: transport?.ownsHost === true || pageLocation === undefined || isLoopbackHostname(pageLocation.hostname),
+    isLoopback: transport?.ownsHost === true || pageLocation === undefined || isLoopbackHostname(pageLocation.hostname) || (globalThis as ClientTransportGlobal).__DSH_PROXY_AUTH__ === true,
     generation: {
       getSnapshot: () => generation,
       subscribe: (listener) => {

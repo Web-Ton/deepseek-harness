@@ -14,6 +14,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import {
   DESKTOP_HOST_PACKAGE,
   desktopCorePackageOverrides,
@@ -56,6 +57,39 @@ function migrateProfileSettings(projectDir: string): void {
   }
 }
 
+/** Payload marker shipped in extraResources by the AI Shell builder; its absence restores stock upstream behavior. */
+const AISHELL_PAYLOAD_DIR = 'aishell-payload'
+const AISHELL_PAYLOAD_MANIFEST = 'aishell-payload-manifest.json'
+const AISHELL_PREINSTALL_MODULE = 'aishell-preinstall.mjs'
+
+/**
+ * Run the AI Shell payload preinstaller when the builder shipped one.
+ * The marker file is the only trigger signal — never package.json existence,
+ * which `initProfile` creates inside this same lock before this call.
+ * `process.resourcesPath` exists only in the packaged Electron main process,
+ * so build-time tooling that imports this module (prepare-dsh smoke) and the
+ * unpackaged development app both stay on stock upstream behavior.
+ * @param profileDir - Desktop plugin profile receiving the offline install.
+ */
+async function preinstallAishellPayload(profileDir: string): Promise<void> {
+  if (process.resourcesPath === undefined) return
+  const payloadDir = join(process.resourcesPath, AISHELL_PAYLOAD_DIR)
+  if (!existsSync(join(payloadDir, AISHELL_PAYLOAD_MANIFEST))) return
+  // The preinstaller implementation travels in extraResources, not in this
+  // patch, so this seam stays a thin, stable call across base releases.
+  // Dynamic import() requires a file:// URL on Windows — a bare path like
+  // C://...//aishell-preinstall.mjs is rejected with ERR_UNSUPPORTED_ESM_URL_SCHEME
+  // because the ESM loader interprets the drive letter as a URL scheme.
+  const preinstallModulePath = join(payloadDir, AISHELL_PREINSTALL_MODULE)
+  const preinstall = (await import(pathToFileURL(preinstallModulePath).href)) as {
+    default?: (options: { profileDir: string }) => Promise<void>
+    preinstall?: (options: { profileDir: string }) => Promise<void>
+  }
+  const entry = preinstall.default ?? preinstall.preinstall
+  if (entry === undefined) throw new Error('aishell preinstall: module exports no preinstall entry')
+  await entry({ profileDir })
+}
+
 /** Initializes the Desktop profile and disables third-party bundles during recovery. */
 export class DesktopProjectManager {
   /**
@@ -80,11 +114,14 @@ export class DesktopProjectManager {
    * Load application metadata and prepare the external plugin profile without installing packages.
    */
   async applyRelease(): Promise<void> {
-    await this.withLock(() => {
+    await this.withLock(async () => {
       // Validation only: an unreadable or mismatched runtime descriptor stops preparation before the Host starts.
       readDesktopRuntime(this.runtime.dsh)
       migrateProfileSettings(this.paths.profile)
       createPluginProfile(this.paths.profile)
+      // AI Shell distribution: offline payload install inside the same profile
+      // lock, completed before the Host starts (marker absent: stock behavior).
+      await preinstallAishellPayload(this.paths.profile)
       removeLinkProjections(this.paths.profile)
     })
   }

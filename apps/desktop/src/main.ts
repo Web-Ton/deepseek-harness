@@ -1090,8 +1090,15 @@ async function main(): Promise<void> {
   }
 
   const readWelcomeState = async () => {
-    if (backend.host === undefined || welcomeBackend === undefined) throw new Error('desktop welcome: backend unavailable')
-    return welcomeBackend.read()
+    // AI Shell distribution (D3 welcome retirement, 0.2.2): the boot's
+    // unconditional welcome wire-read drags the whole desktop down when the
+    // web listener rejects the request (0.2.2's openInitialWindow awaits
+    // this before entering the workspace). The distribution has no welcome
+    // flow - credentials are Huawei Cloud AK/SK configured in-app by the
+    // preinstalled plugins - so the state is static and the wire is never
+    // consulted. localePreference null walks resolveDesktopStartupLocale's
+    // official system-language fallback.
+    return { loggedIn: false, hasApiKey: false, writable: true, localePreference: null } satisfies WelcomeState
   }
   stopForRecovery = async () => {
     const reports = stopOperationReports()
@@ -1807,10 +1814,15 @@ async function main(): Promise<void> {
     window.focus()
   }
 
-  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('dsh')
+  // AI Shell distribution: register "aishell://" instead of "dsh://" so each
+  // app owns its own Windows URL-handler registry entry (HKCR\aishell vs
+  // HKCR\dsh). Sharing "dsh://" caused last-installed-wins overwrite and
+  // cross-app open-url races when the official DSH desktop and AI Shell
+  // coexist on one machine.
+  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('aishell')
   app.on('open-url', (event, url) => {
     event.preventDefault()
-    if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
+    if (url === 'aishell://open' || url === 'aishell://open/') focusPrimaryWindow()
   })
 
   app.on('activate', (_event, hasVisibleWindows) => {
@@ -1924,6 +1936,15 @@ async function main(): Promise<void> {
   publishUpdate(updateState)
 }
 
+// AI Shell distribution: claim a single-instance lock key distinct from the
+// official DSH desktop app. Electron's requestSingleInstanceLock keys on
+// app.name, which defaults to package.json's "name" — identical
+// ("@deepseek-ai/dsh-desktop") across the official and AI Shell builds.
+// Without this, the app that starts second sees the first's lock and
+// silently quits. Set at module top level before the lock claim below;
+// main() runs too late (after whenReady). Mirrors the upstream dev build's
+// per-bundle CFBundleIdentifier (development-app.ts) for the same reason.
+app.setName('AI Shell')
 const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
 
 if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
