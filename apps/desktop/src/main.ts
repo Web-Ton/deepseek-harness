@@ -6,8 +6,12 @@ import type { DesktopChannelState, DesktopChannelChangeResult } from '@deepseek-
 import { DesktopUpdateSettings } from './update-settings.ts'
 import { isDesktopUpdateChannel } from './settings-file.ts'
 import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
-import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
-import { access, readFile, writeFile } from 'node:fs/promises'
+import { WINDOWS_TITLEBAR_HEIGHT, selfDrawnChrome } from './windows-layout.ts'
+/** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
+
+import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { createReadStream, existsSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -39,8 +43,12 @@ import { readDeviceInfo } from './device-info.ts'
 import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
 import type { DesktopMessages } from './locale.ts'
 import { claimDesktopSingleInstance } from './single-instance.ts'
+import {
+  AISHELL_DEEPLINK_SCHEME, DeepLinkDelivery, DeepLinkSocketListener, findDeepLink, isOpenLiteral, realSocketPlatform,
+} from './aishell-deeplink.ts'
 import { desktopUpdateChannel } from './update-channel.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+import { AishellUpdateBridge, aishellPlatform } from './aishell-update-bridge.ts'
 import { prepareDesktopUpdateWindow } from './update-window.ts'
 import { DesktopCommandManager } from './command-management.ts'
 import { serveWebDocument, authenticateWebHost, forwardWebRequest, removeLegacyHostCookies } from './web-document.ts'
@@ -50,7 +58,7 @@ import { OperationJournal } from './operation-journal.ts'
 import { runOperationReportJob, type OperationReportJobResult } from './operation-report-job.ts'
 import { openWelcomeWindow } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeNotice } from './welcome-api.ts'
-import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
+import { connectDesktopWelcome, type DesktopWelcomeBackend, type WelcomeState } from './welcome-backend.ts'
 import { DesktopUpdateJournal } from './update-journal.ts'
 import { DesktopUpdatePreparationError } from './update-error.ts'
 import { DesktopUpdateSchedule, resolveDesktopUpdateScheduleConfig } from './update-schedule.ts'
@@ -72,9 +80,36 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
 import { DesktopTray } from './tray.ts'
 import { DesktopBackgroundNotice } from './background-notice.ts'
 
-let focusPrimaryWindow = (): void => {}
+let focusPrimaryWindow: (force?: boolean) => void = () => {}
 let stopForRecovery = async (): Promise<void> => { await stopOperationReports() }
 let shuttingDown = false
+/**
+ * AI Shell distribution (deeplink host delivery): the main process's deep-link
+ * entry hub, created AT MODULE SCOPE on purpose. The OS can hand the app a URL
+ * before `whenReady` (macOS `open-url` fires during launch; the cold-start argv
+ * is read once at module load) — those early URLs must land in the hub's stash,
+ * not in a placeholder that drops them. The send callback resolves the Host
+ * child through `deepLinkBackend`, which main() assigns once the backend
+ * controller exists; until then delivery returns false and the hub stashes
+ * (LAST wins — the frozen design ruling). The URL string is forwarded
+ * UNMODIFIED; no hop parses it.
+ */
+const deepLinkHub = new DeepLinkDelivery((url) => {
+  const backend = deepLinkBackend
+  if (backend === undefined) return false
+  const host = backend.host
+  if (host === undefined) return false
+  return host.sendDeepLink(url)
+})
+let deepLinkBackend: { host: { sendDeepLink(url: string): boolean } | undefined } | undefined
+const deliverDeepLink: (url: string) => void = (url) => { deepLinkHub.deliver(url) }
+/**
+ * AI Shell distribution (deeplink host delivery): Linux-packaged socket fast
+ * path (contract §12, adopted) — the URL-handler helper connects here for
+ * warm delivery without a second Electron process. Bound after the
+ * single-instance lock, disposed at quit.
+ */
+let disposeDeepLinkSocket: () => Promise<void> = async () => {}
 /**
  * Set by quit entries that must not ask: crash recovery exit and restart, and the
  * development restart command. The installer handoff has its own before-quit branch.
@@ -268,9 +303,9 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     minWidth: 520,
     minHeight: 600,
     show,
-    ...(process.platform === 'win32' && primary ? {
-      backgroundColor: chromeFallbackFill(),
+    ...(selfDrawnChrome() && primary ? {
       titleBarStyle: 'hidden' as const,
+      backgroundColor: chromeFallbackFill(),
       titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT, color: chromeFallbackFill(),
         symbolColor: nativeTheme.shouldUseDarkColors ? '#f9fafb' : '#0f1115' },
     } : {}),
@@ -310,7 +345,7 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     // current state so a fullscreen reload does not fall back to windowed CSS.
     window.webContents.on('did-finish-load', sendFullscreen)
   }
-  if (process.platform === 'win32' && primary) {
+  if (selfDrawnChrome() && primary) {
     const updateBackground = (): void => {
       if (!window.isDestroyed()) window.setBackgroundColor(chromeFallbackFill())
     }
@@ -360,7 +395,9 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
       const messages = currentDesktopLocale().messages
       Menu.buildFromTemplate(items.map(item => ({
         ...item,
-        ...(process.platform === 'win32' && item.role !== undefined && item.role in messages
+        // AI Shell distribution (Linux menu i18n): role labels are localized
+        // on Windows and Linux alike - macOS leaves them to AppKit.
+        ...(process.platform !== 'darwin' && item.role !== undefined && item.role in messages
           ? { label: messages[item.role as keyof typeof messages] } : {}),
         accelerator: '',
       }))).popup({ window })
@@ -464,6 +501,10 @@ async function main(): Promise<void> {
     const controller = new AbortController()
     ordinaryDialogs.add(controller)
     try {
+      // AI Shell distribution (D14 rev6 instrumentation): the silent no-parent
+      // return is a real "clicked but nothing appeared" cause when no window is
+      // alive — make it visible in stdout instead of vanishing.
+      if (parent === undefined) console.warn('aishell update check: no parent window — dialog suppressed')
       if (parent === undefined) return { response: options.cancelId ?? 0, checkboxChecked: false }
       return await updateDialog.show(parent, { ...options, signal: controller.signal })
     }
@@ -472,9 +513,332 @@ async function main(): Promise<void> {
   // Copy comes from the same locale as the update prompts so the dialog
   // chrome and its content never mix languages.
   const showAbout = async (): Promise<void> => {
+    // AI Shell distribution (D14): the About box reports the DISTRIBUTION's
+    // own identity, never the base version alone (app.getVersion() reports
+    // the upstream base — not what a user comparing releases needs on its
+    // own). Two lines: the app (dist) version from the A3 version file, and
+    // the DSH base version from app.getVersion(); dev runs without the
+    // version file degrade to the official single-line form.
+    let appVersion: string | undefined
+    try {
+      appVersion = (await readFile(join(process.resourcesPath, 'aishell-version'), 'utf8')).trim()
+    } catch { /* dev layout — no version file */ }
+    // Localized labels (zh: 应用版本/DSH 版本, others: App/DSH version) — the
+    // About box follows the UI language, never mixed bilingual.
+    const zh = locale.id === 'zh-CN'
+    const appLabel = zh ? '应用版本' : 'App version'
+    const dshLabel = zh ? 'DSH 版本' : 'DSH version'
+    const detail = appVersion === undefined
+      ? formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() })
+      : `${appLabel} ${appVersion}\n${dshLabel} ${app.getVersion()}`
     await ordinaryMessageBox({ type: 'info', title: locale.messages.aboutMenu, message: locale.messages.aboutProduct,
-      detail: formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }),
+      detail,
       buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+  }
+  // AI Shell distribution (D15 rev13, macOS upgrade chain — desktop half):
+  // the 下载更新 click on darwin runs IN the app — pinned re-check,
+  // resumable curl download, streamed sha256 verify — so the user keeps
+  // working while the artifact lands, with osascript notifications
+  // carrying the phases (the accepted notification-level UX; no percent
+  // surface). The verified dmg then hands off to the update module's
+  // darwin-install subcommand and the app quits itself cleanly
+  // (shellInstallerOwnsQuit: the click was the consent — the quit question
+  // must not ask twice). Linux/Windows keep the packaged-launcher chain
+  // inside checkAishellUpdates below.
+  // AI Shell distribution (D15, changelog task 2026-10-22): the optional
+  // feed changelog rides the check result; display-only, absent key = no
+  // block (one window one language — never the other language).
+  type AishellCheckResult = { update: { version: string; artifactUrl?: string; sha256?: string; changelog?: { en?: string; zh?: string } } | null; version: string; error: string | null }
+  // One spawn handle per helper, passed (not re-imported): two concurrent
+  // dynamic imports of the same mocked builtin race in the module runner —
+  // the loser resolves the NATIVE module and escapes the test double
+  // (found while driving this chain in main-startup.spec).
+  const showMacNotification = (spawn: typeof import('node:child_process')['spawn'], body: string): void => {
+    const escaped = body.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
+    const child = spawn('osascript', ['-e', `display notification "${escaped}" with title "AI Shell"`], { stdio: 'ignore' })
+    child.on('error', () => undefined) // notifications are best-effort
+  }
+  const runAishellCheck = async (module: string): Promise<AishellCheckResult> => {
+    const { spawn } = await import('node:child_process')
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--expose-internals', module, 'check', '--json', '--force'], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString('utf8') })
+      child.on('error', reject)
+      child.on('close', (code: number | null) => { code === 0 ? resolve(out) : reject(new Error(`exit ${code ?? 'signal'}`)) })
+    })
+    return JSON.parse(stdout) as AishellCheckResult
+  }
+  const runMacAishellUpgrade = async (module: string): Promise<void> => {
+    const fail = async (technical: string): Promise<void> => {
+      await ordinaryMessageBox({ type: 'warning', title: locale.messages.updateCheckTitle, message: locale.messages.updateCheckTitle,
+        detail: locale.messages.updateCheckFailed, technicalDetails: technical,
+        buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+    }
+    // Pinned re-check at click time (the dialog that asked may have aged in
+    // a cache): the bytes installed must be the bytes the feed named when
+    // the user said yes — the same law as `aishell upgrade`'s pre-flight.
+    let pinned: AishellCheckResult
+    try { pinned = await runAishellCheck(module) } catch (error) { await fail(error instanceof Error ? error.message : String(error)); return }
+    if (pinned.update === null) {
+      if (pinned.error !== null) { await fail(pinned.error); return }
+      await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+        message: locale.messages.updateCurrent,
+        detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: pinned.version }),
+        buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+      return
+    }
+    const update = pinned.update
+    if (update.artifactUrl === undefined || update.sha256 === undefined) {
+      await fail('feed entry lacks artifactUrl/sha256 — the packaged update module predates the macOS chain')
+      return
+    }
+    const artifactUrl = update.artifactUrl
+    const sha256 = update.sha256
+    const { spawn } = await import('node:child_process')
+    showMacNotification(spawn, formatDesktopMessage(locale.messages.updateBackgroundDownload, { }))
+    const workDir = await mkdtemp(join(tmpdir(), 'aishell-upgrade-'))
+    const dmgPath = join(workDir, 'update.dmg')
+    try {
+      // Resumable download, five attempts — install.sh's fetch contract
+      // (mid-body resets on long-haul links are not in curl's transient
+      // list; -C - resumes from the partial file).
+      for (let attempt = 1; ; attempt++) {
+        const ok = await new Promise<boolean>((resolve, reject) => {
+          const child = spawn('curl', ['-fL', '--retry', '3', '-C', '-', '-o', dmgPath, artifactUrl], { stdio: 'ignore' })
+          child.on('error', reject)
+          child.on('close', (code: number | null) => { resolve(code === 0) })
+        })
+        if (ok) break
+        if (attempt === 5) throw new Error(`curl download failed (attempt ${attempt})`)
+      }
+      // Streamed verify — a ~450MB dmg never buffers whole.
+      const { createHash } = await import('node:crypto')
+      const hash = createHash('sha256')
+      await new Promise<void>((resolve, reject) => {
+        createReadStream(dmgPath)
+          .on('data', (chunk: string | Buffer) => { hash.update(chunk) })
+          .on('error', reject)
+          .on('end', () => { resolve() })
+      })
+      const actual = hash.digest('hex')
+      if (actual !== sha256) throw new Error(`checksum mismatch (expected ${sha256.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`)
+    } catch (error) {
+      rmSync(workDir, { recursive: true, force: true })
+      await fail(error instanceof Error ? error.message : String(error))
+      return
+    }
+    // Hand off: the detached module survives this app's exit, finishes the
+    // install (mount/replace/relaunch), and owns its log + failure dialogs
+    // (its darwin-install subcommand removes the dmg and its workdir).
+    // AISHELL_UPGRADE_LOCALE keeps the module's dialogs in the app language.
+    showMacNotification(spawn, formatDesktopMessage(locale.messages.updateInstalling, { }))
+    const child = spawn(process.execPath, ['--expose-internals', module, 'darwin-install', dmgPath, update.version, String(process.pid)], {
+      detached: true, stdio: 'ignore',
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1',
+        AISHELL_UPGRADE_LOCALE: locale.id === 'zh-CN' ? 'zh' : 'en' } })
+    child.unref()
+    shellInstallerOwnsQuit = true
+    app.quit()
+  }
+  // AI Shell distribution (D14 first-party update check): the official
+  // "Check for Updates…" menu item and the renderer's updatesOpen IPC both
+  // used to drive the official electron-updater chain, which is inert in
+  // unsigned builds (no app-update.yml) — the menu item answered a click
+  // with nothing. This replacement asks the DISTRIBUTION's own updater
+  // (resources/aishell-update/aishell-update.mjs, A3) and reports the
+  // result through the same dialog surface as About. The user decision
+  // law: this only INFORMS (and names the upgrade command); it never
+  // installs anything — `aishell upgrade` (user-invoked) owns the install
+  // chain. Dev runs without the module stay stock: the click falls back to
+  // the official prompt exactly as upstream shipped it.
+  //
+  // ASYNC LAW (revision after a real VM test): the check runs OFF the menu
+  // click's critical path — a synchronous await here froze the menu IPC
+  // for the Electron cold start + feed fetch (seconds), and a window
+  // close during that window collided with the official quit
+  // confirmation's focus handling (close button appeared dead). The click
+  // now returns instantly; the dialog appears whenever the check lands.
+  // Concurrent clicks join one in-flight check instead of stacking.
+  let aishellCheckOperation: Promise<void> | undefined
+  const checkAishellUpdates = (): void => {
+    aishellCheckOperation ??= (async (): Promise<void> => {
+      const module = join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs')
+      // AishellCheckResult (not a narrower inline shape): the dialog below
+      // reads update.changelog for the detail block — the narrow
+      // `{ version: string }` form type-checked only under vitest's
+      // esbuild (no type gate) and failed the real build's tsc
+      // (found 2026-10-22 on the alpha.39 experience build).
+      let result: AishellCheckResult
+      try {
+        result = await runAishellCheck(module)
+      } catch (error: unknown) {
+        result = { update: null, version: app.getVersion(), error: error instanceof Error ? error.message : String(error) }
+      }
+      aishellCheckOperation = undefined
+      // Instrumentation (D14 rev6): every field report of "clicked, nothing
+      // appeared" came without any trace. Log the full decision so the
+      // app's stdout (the wrapper terminal) always tells which branch ran:
+      // the check result, the dialog branch, and any silent-return cause.
+      console.info(`aishell update check: local=${result.version} update=${result.update?.version ?? 'none'} error=${result.error ?? 'none'}`)
+      if (result.error !== null && result.update === null) {
+        await ordinaryMessageBox({ type: 'warning', title: locale.messages.updateCheckTitle, message: locale.messages.updateCheckTitle,
+          // rev8: official copy; the technical reason rides technicalDetails
+          // (the dialog's expandable diagnostics field), not the detail line.
+          detail: locale.messages.updateCheckFailed,
+          technicalDetails: String(result.error), buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+        return
+      }
+      if (result.update === null) {
+        // Official copy exactly (updateCurrent / updateCurrentDetail) — the
+        // version shown is the DISTRIBUTION version from the first-party
+        // check result, never app.getVersion() (which reports the base
+        // version) and never the plugin-set version.
+        await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+          message: locale.messages.updateCurrent,
+          detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: result.version }),
+          buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+        return
+      }
+      // rev8: user-decision dialog — a new version gets REAL choices, not an
+      // acknowledge-only box. Official copy (updateDownloadedTitle + detail);
+      // buttons: 立即升级 runs the user-owned install chain via the packaged
+      // launcher (same chain as the startup question and `aishell upgrade`);
+      // 暂不 (updateLater) dismisses — the menu item remains the door back,
+      // and no decline is recorded here (this was a user-initiated check).
+      // Changelog block (2026-10-22): the feed's optional changelog for the
+      // UI language heads the detail; a missing key hides the whole block
+      // (never the other language) and the detail is exactly today's.
+      const changelog = locale.id === 'zh-CN' ? result.update.changelog?.zh : result.update.changelog?.en
+      const detail = changelog === undefined
+        ? formatDesktopMessage(locale.messages.updateDownloadedDetail, { })
+        : `${locale.messages.updateWhatsNew}\n${changelog}\n\n${formatDesktopMessage(locale.messages.updateDownloadedDetail, { })}`
+      const choice = await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+        message: formatDesktopMessage(locale.messages.updateDownloadedTitle, { version: result.update.version }),
+        detail,
+        buttons: [locale.messages.updateDownload, locale.messages.updateLater], cancelId: 1 })
+      if (choice.response === 0) {
+        // AI Shell distribution (D15 rev13): macOS runs the in-app chain
+        // (download + verify here, install via the module's darwin-install
+        // after a clean quit). The packaged launcher below stays the
+        // Linux/Windows install chain, and its absence there (stripped
+        // artifact) still degrades to the manual-download instruction.
+        if (process.platform === 'darwin') {
+          await runMacAishellUpgrade(module)
+          return
+        }
+        // AI Shell distribution (D15 win32 upgrade path, 2026-10-20):
+        // the 下载更新 click must close the running app before the install
+        // chain can replace the exe. On win32 the Host's task-protection
+        // protocol is reachable ONLY while the app is alive (Host IPC), so
+        // this hunk owns the graceful-shutdown sequence — mirroring the
+        // official beforeRestart hook (main.ts:591-638) — BEFORE spawning
+        // aishell-upgrade.mjs. The chain (ACK=1) then handles only the
+        // residual Electron shell. Skipping task protection here would hard-
+        // kill the Host and lose the user's running work (W-U15).
+        if (process.platform === 'win32') {
+          // Stripped-artifact guard BEFORE task protection: a missing
+          // aishell-upgrade.mjs degrades to the manual-download instruction
+          // (same law as the Linux launcher guard below) — checking first
+          // avoids locking the Host for an install that can never run.
+          const upgradeModule = join(process.resourcesPath, 'aishell-update', 'aishell-upgrade.mjs')
+          if (!existsSync(upgradeModule)) {
+            await ordinaryMessageBox({ type: 'info', title: locale.messages.updateManualDownloadTitle,
+              message: locale.messages.updateManualDownloadTitle,
+              detail: locale.messages.updateManualDownloadDetail,
+              buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+            return
+          }
+          const host = backend.host
+          if (host !== undefined) {
+            // Inspect active tasks; if any, ask the user to stop them
+            // (official updateActiveTasks copy + stopTasks/updateLater).
+            const active = await host.updateTasks('inspect')
+            if (active) {
+              const confirm = await ordinaryMessageBox({ type: 'warning',
+                title: locale.messages.updateTitle,
+                message: locale.messages.updateActiveTasks,
+                detail: locale.messages.updateActiveTasksDetail,
+                buttons: [locale.messages.updateStopTasks, locale.messages.updateLater],
+                defaultId: 1, cancelId: 1 })
+              if (confirm.response !== 0) return  // user chose "later" — no install
+            }
+            // Lock: reject new task HTTP, then gracefully stop the Host.
+            // unlock on failure so a stopped-host error doesn't strand the lock.
+            await host.updateTasks('lock')
+            try {
+              await platformView.closeAndWait()
+              await backend.stop()
+            } catch (error) {
+              await host.updateTasks('unlock').catch((unlockError: unknown) => { console.error(unlockError) })
+              throw error
+            }
+          }
+          // Host stopped (or never running) → spawn the upgrade chain via
+          // cmd.exe /c start. Two problems this solves (both field-proven):
+          //   1. Quote trap: an earlier rev used `cmd /d /s /c "${cmd}" upgrade`
+          //      but cmd /s strips the outer quote pair, leaving the spaced
+          //      default install path (…\Programs\AI Shell\…) bare — cmd splits
+          //      at the space and exits 1, the chain never started.
+          //   2. Job kill: `spawn(process.execPath, …, { detached: true })` stays
+          //      in the Electron process's Job Object; app.quit() closes the Job
+          //      and the detached child is killed mid-download (died at ~65%).
+          // `start ""` creates a fully independent process that breaks away
+          // from the Job (field-proven: child survives parent exit). The first
+          // "" is the mandatory empty window title; each spaced arg quoted.
+          // Spawning process.execPath directly (not aishell.cmd) avoids the
+          // CVE-2024-27980 .cmd-without-shell gate and the cmd /s quote trap
+          // in one move. aishell-upgrade.mjs resolves its own stateDir from
+          // USERPROFILE, no DSH_HOME needed. Detached + unref: the chain
+          // outlives this app's process. ACK=1 = consent to close was given
+          // above (or no app was running). AISHELL_FROM_WRAPPER stripped so
+          // the chain relaunches the new version (same law as the Linux path).
+          const { spawn } = await import('node:child_process')
+          const child = spawn('cmd.exe', ['/d', '/c', 'start', '""',
+            `"${process.execPath}"`, `"${upgradeModule}"`, 'upgrade'], {
+            detached: true, stdio: ['ignore', 'ignore', 'ignore'],
+            windowsVerbatimArguments: true,
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', AISHELL_UPGRADE_ACK: '1', AISHELL_FROM_WRAPPER: undefined } })
+          child.unref()
+          // Quit the Electron main process after spawning the detached upgrade
+          // chain: backend.stop() halted the Host (the "重新连接中" the UI shows),
+          // but the Electron shell stays alive holding the exe file lock — NSIS /S
+          // cannot replace a running exe. The official beforeRestart hook relies
+          // on quitAndInstall() to do this; the A3 chain owns the reinstall, so
+          // app.quit() here releases the lock and closes the window. The detached
+          // child (unref'd) outlives this process and relaunches the new version.
+          app.quit()
+        } else {
+          // AI Shell distribution (D15): the packaged launcher owns the
+          // Linux install chain; a stripped artifact (no launcher) degrades
+          // to the manual-download instruction instead of an ENOENT crash.
+          const launcher = join(process.resourcesPath, 'aishell-launcher', 'aishell')
+          if (!existsSync(launcher)) {
+            await ordinaryMessageBox({ type: 'info', title: locale.messages.updateManualDownloadTitle,
+              message: locale.messages.updateManualDownloadTitle,
+              detail: locale.messages.updateManualDownloadDetail,
+              buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+            return
+          }
+          const { spawn } = await import('node:child_process')
+          // Detached: the install chain may close this app; its stdio inherits
+          // the app's (the wrapper terminal) so progress stays visible.
+          // AISHELL_UPGRADE_ACK: the 下载更新 click is the consent to close the
+          // running app; the detached child has no tty, so the interactive ask
+          // would read /dev/tty, fail, and abort the install (field-proven).
+          const child = spawn(launcher, ['upgrade'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'],
+            // Strip AISHELL_FROM_WRAPPER: the wrapper exports it for ITS chain (the wrapper
+            // relaunches the app after its own startup-dialog upgrade, so the chain must not
+            // spawn a second instance). The app INHERITS it from the wrapper that launched it,
+            // and without stripping it here it leaks into app-initiated chains — an upgrade
+            // started from the in-app menu then skipped the relaunch entirely (field-proven:
+            // decline at startup → manual check → 下载更新 → no window after success).
+            env: { ...process.env, AISHELL_UPGRADE_ACK: '1', AISHELL_FROM_WRAPPER: undefined } })
+          child.unref()
+        }
+      }
+    })().catch((error: unknown) => { console.error(error) })
   }
   const commandManager = new DesktopCommandManager({
     resources: process.resourcesPath,
@@ -529,8 +893,13 @@ async function main(): Promise<void> {
     return next.promise
   }
   const platformView = new DesktopPlatformView(join(app.getAppPath(), 'lib', 'preload-platform-account.cjs'),
-    () => locale.id === 'zh-CN' ? 'zh_CN' : 'en_US', process.platform === 'win32' ? 'win32' : 'darwin',
+    () => locale.id === 'zh-CN' ? 'zh_CN' : 'en_US', process.platform === 'win32' ? 'win32' : process.platform === 'linux' ? 'linux' : 'darwin',
     owner => isMandatory() || updateOverlays.input(owner).blocked)
+  // AI Shell distribution (deeplink host delivery): the hub itself lives at
+  // module scope (early URLs — cold-start argv, macOS pre-ready open-url —
+  // must reach it before main() runs); main() only wires the backend whose
+  // `.host` the send callback reads. Until this assignment the hub stashes;
+  // the readiness observer below flushes once the Host child reports ready.
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
@@ -607,11 +976,20 @@ async function main(): Promise<void> {
       updateTasks: (action: 'inspect' | 'lock' | 'unlock') => host.updateTasks(action),
       inspectQuit: () => host.inspectQuit(),
       resolveDragResource: (address: string, signal?: AbortSignal) => host.resolveDragResource(address, signal),
+      sendDeepLink: (url: string) => host.sendDeepLink(url),
     }
   }, (state) => {
     if (state.phase === 'error') reportFatal(state.failure, 'host')
     else if (!shuttingDown) backendReady = state.phase === 'ready'
+    // AI Shell distribution (deeplink host delivery): flush the pending
+    // deep link once the Host child reports readiness (buffer #1 empties
+    // here); a Host replacement (update restore path) re-arms the hub.
+    if (state.phase === 'ready') deepLinkHub.hostReady()
+    else if (state.phase === 'starting') deepLinkHub.hostReplaced()
   })
+  // Wire the module-scope hub's send callback to this backend controller:
+  // until now early URLs stashed; from here `.host` is live for delivery.
+  deepLinkBackend = backend
 
   const updateErrors = new WeakMap<DesktopUpdateState, Promise<void>>()
   const showUpdateFailure = (state: DesktopUpdateState): Promise<void> => {
@@ -667,9 +1045,91 @@ async function main(): Promise<void> {
     return state
   }
 
-  const readWelcomeState = async () => {
-    if (backend.host === undefined || welcomeBackend === undefined) throw new Error('desktop welcome: backend unavailable')
-    return welcomeBackend.read()
+  // AI Shell distribution (D19 settings-update-button): the bridge drives
+  // the official web indicator from the first-party updater on Linux
+  // packaged runs. It publishes through publishUpdate (single-writer: the
+  // official coordinator stays idle — this distribution ships no
+  // app-update.yml), guards busy/once installations on the main-process
+  // side, restores the ready phase from a persisted staging, and is
+  // fail-open by construction (a bridge defect hides the button, never
+  // kills the app). Win/mac keep the D14 menu flow; dev runs stay stock.
+  let updateBridge: AishellUpdateBridge | undefined
+  if (process.platform === 'linux' && app.isPackaged
+    && existsSync(join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs'))) {
+    try {
+      updateBridge = new AishellUpdateBridge(publishUpdate, aishellPlatform(process.resourcesPath, process.execPath),
+        true, 10 * 60_000, async (version: string) => {
+          // The official ready confirmation (official copy, official dialog):
+          // 安装并重启 is the ONLY acceptance; the cancelId is a nonexistent
+          // index, so X/Esc/replacement can never read as consent.
+          const ready = desktopUpdateReadyConfirmation(locale.messages, version, process.platform)
+          const parent = currentDialogWindow()
+          if (parent === undefined) return false
+          const result = await updateDialog.show(parent, {
+            type: 'info', title: locale.messages.updateTitle,
+            message: ready.message, detail: ready.detail,
+            buttons: [locale.messages.installAndRestart], defaultId: 1, cancelId: 1,
+          })
+          return result.response === 0
+        })
+      // Startup pass: a check immediately (fresh info for the button), then
+      // staging recovery against whatever the check learned.
+      void updateBridge.backgroundCheck().then(async () => {
+        const bridge = updateBridge
+        if (bridge === undefined) return
+        await bridge.resume((candidate) => {
+          const state = bridge.status
+          return state.phase === 'available' && state.version !== undefined
+            && compareAishellVersions(state.version, candidate) > 0
+        })
+      }).catch((error: unknown) => { console.error(error) })
+      console.info('aishell update bridge: active (10-minute cadence, startup check)')
+    } catch (error) { console.error('aishell update bridge: disabled (init failure)', error) }
+  }
+  /** Semver precedence for the resume gate; 0 when unparseable (treated as unknown → resume declines). */
+  function compareAishellVersions(a: string, b: string): number {
+    const pa = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(a)
+    const pb = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(b)
+    if (pa === null || pb === null) return 0
+    for (let i = 1; i <= 3; i++) {
+      const x = Number(pa[i]), y = Number(pb[i])
+      if (x !== y) return x < y ? -1 : 1
+    }
+    const ra = pa[4] === undefined ? [] : pa[4].split('.')
+    const rb = pb[4] === undefined ? [] : pb[4].split('.')
+    if (ra.length === 0 && rb.length === 0) return 0
+    if (ra.length === 0) return 1
+    if (rb.length === 0) return -1
+    for (let i = 0; i < Math.max(ra.length, rb.length); i++) {
+      const x = ra[i], y = rb[i]
+      if (x === undefined) return -1
+      if (y === undefined) return 1
+      if (x === y) continue
+      const xn = /^-?\d+$/.test(x), yn = /^-?\d+$/.test(y)
+      if (xn && yn) return Number(x) < Number(y) ? -1 : 1
+      if (xn) return -1
+      if (yn) return 1
+      return x < y ? -1 : 1
+    }
+    return 0
+  }
+
+  const readWelcomeState = async (): Promise<WelcomeState> => {
+    // AI Shell distribution (D3 welcome retirement, 0.2.2): the boot's
+    // welcome wire-read drags the whole desktop down when the web listener
+    // rejects the request (0.2.2's openInitialWindow awaits this before
+    // entering the workspace). The distribution has no welcome flow —
+    // credentials are Huawei Cloud AK/SK configured in-app by the
+    // preinstalled plugins — so the authentication fields are static and the
+    // heavy read (provider directory + credential metadata RPCs) never runs.
+    // 0.2.2-rc.3 made openInitialWindow consume the user's locale and THEME
+    // preferences from this state, so the LIGHT path remains: one
+    // settings.describe RPC feeds both (a failure falls back to the
+    // system locale and the system theme — the boot never dies on it).
+    const preferences = await welcomeBackend?.readPreferences()
+      .catch(() => ({ localePreference: null, themePreference: 'system' as const })) ??
+      { localePreference: null, themePreference: 'system' as const }
+    return { loggedIn: false, hasApiKey: false, writable: true, ...preferences }
   }
   stopForRecovery = async () => {
     const reports = stopOperationReports()
@@ -937,7 +1397,10 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.updatesStatus, (event) => {
     assertProductSender(event)
-    return updatePresentation(updates.state)
+    // AI Shell distribution (D19 settings-update-button): the bridge owns
+    // the state on Linux packaged runs — the web indicator queries THIS,
+    // not the inert electron-updater coordinator (no app-update.yml here).
+    return updatePresentation(updateBridge !== undefined ? updateBridge.status : updates.state)
   })
   ipcMain.handle(DESKTOP_IPC.deviceInfo, (event) => {
     assertProductSender(event)
@@ -945,7 +1408,10 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.onboardingApiKey, async (event) => {
     assertProductSender(event)
-    return (await readWelcomeState()).hasApiKey
+    // AI Shell distribution (D3 welcome retirement): key discovery is static
+    // — no welcome wire read on this path (the light preferences read serves
+    // openInitialWindow only). Credentials live in the preinstalled plugins.
+    return false
   })
   ipcMain.on(DESKTOP_IPC.onboardingActive, (event, active: unknown) => {
     const window = mainWindow
@@ -960,6 +1426,14 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.updatesOpen, async (event) => {
     assertProductSender(event)
+    // AI Shell distribution (D19 settings-update-button): on Linux packaged
+    // runs the button drives the bridge (official semantics: available ->
+    // download with inline progress -> ready -> confirmation). Other packaged
+    // platforms keep the D14 menu-dialog flow; dev runs stay stock.
+    if (updateBridge !== undefined) {
+      updateBridge.open()
+      return
+    }
     await openUpdatePrompt()
   })
 
@@ -1146,19 +1620,29 @@ async function main(): Promise<void> {
 
   const automaticCheck = (): void => {
     if (!quitting) void mandatoryPolicy?.check('foreground-or-resume').catch((error: unknown) => { console.error(error) })
-    if (!quitting) void updateSchedule.check().catch((error: unknown) => { console.error(error) })
+    // AI Shell distribution (D19): the bridge owns the ordinary polling on
+    // Linux packaged runs — the official coordinator would publish a
+    // no-packaged-source error on every tick and the button would flip to
+    // retry. Single-writer law.
+    if (!quitting && updateBridge === undefined) void updateSchedule.check().catch((error: unknown) => { console.error(error) })
+    if (!quitting && updateBridge !== undefined) void updateBridge.backgroundCheck().catch((error: unknown) => { console.error(error) })
   }
   powerMonitor.on('resume', automaticCheck)
   app.on('will-quit', () => {
+    updateBridge?.dispose()
     updateSchedule.dispose()
     powerMonitor.off('resume', automaticCheck)
     updates.dispose()
+    // AI Shell distribution (deeplink host delivery): the socket fast path
+    // listener dies with the app (the helper's next connect falls to its
+    // spawn fallback — which IS the retry, by design).
+    void disposeDeepLinkSocket()
   })
 
   const applicationIconPath = development ? join(app.getAppPath(), 'resources', 'icon-windows.png')
     : join(process.resourcesPath, 'icon.png')
   app.setAboutPanelOptions({
-    applicationName: 'DeepSeek Harness',
+    applicationName: 'AI Shell',
     applicationVersion: app.getVersion(),
     // The release has no separate build number; omit Electron's bundle version.
     version: '',
@@ -1201,16 +1685,25 @@ async function main(): Promise<void> {
       { role: 'unhide', label: currentDesktopLocale().messages.showAllApplications }, { type: 'separator' }]
     : []
   const applicationItems = (): MenuItemConstructorOptions[] => [
-    // Windows has no system About panel; Electron's fallback is a plain
-    // message box, so the shell shows its own dimmed dialog instead.
-    process.platform === 'win32'
-      ? { label: currentDesktopLocale().messages.aboutMenu,
-        click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } }
-      : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
+    // AI Shell distribution (D15 rev12): the About item routes to the dist's
+    // own dialog on every platform - the macOS system panel (role 'about')
+    // reports the asar's base version, not the distribution's. macOS keeps
+    // its system panel aligned via setAboutPanelOptions for other triggers.
+    { label: currentDesktopLocale().messages.aboutMenu,
+      click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } },
     { type: 'separator' },
-    { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
-    ...process.platform === 'darwin' || process.platform === 'win32'
-      ? [{ label: currentDesktopLocale().messages.cliCommandMenu, click: () => { void commandManager.show() } }] : [],
+    // AI Shell distribution (D14 rev5): packaged builds route the item to the
+    // first-party updater (async, off the click path — the ASYNC LAW note on
+    // checkAishellUpdates); dev runs keep the official prompt, stock.
+    { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void (existsSync(join(process.resourcesPath, 'aishell-update', 'aishell-update.mjs'))
+      ? checkAishellUpdates()
+      : openUpdatePrompt(true)) } },
+    // AI Shell distribution (aishell command): the upstream "Manage dsh
+    // Command…" menu item is removed on every platform — the dist installs
+    // the `aishell` command itself (NSIS PATH entry on Windows, install.sh
+    // symlink on Linux and macOS) and never routes through the upstream
+    // command-manager, whose macOS contract manages `dsh` for the official
+    // desktop. The manager instance stays wired for update coordination.
     { type: 'separator' },
     ...development ? [
       { label: currentDesktopLocale().messages.reloadPageMenu, role: 'reload' as const },
@@ -1224,7 +1717,7 @@ async function main(): Promise<void> {
     { type: 'separator' },
     ...hideCommands,
     { role: 'quit', ...(darwin ? { label: currentDesktopLocale().messages.quitApplication }
-      : process.platform === 'win32' ? { label: currentDesktopLocale().messages.exitApplication } : {}) },
+      : { label: currentDesktopLocale().messages.exitApplication }) },
   ]
   const devToolsF12Shortcut: MenuItemConstructorOptions = { role: 'toggleDevTools', visible: false, accelerator: 'F12' }
   const windowsDevToolsShortcuts: MenuItemConstructorOptions[] = [
@@ -1232,7 +1725,7 @@ async function main(): Promise<void> {
     devToolsF12Shortcut,
   ]
   const refreshApplicationMenu = (): void => {
-    Menu.setApplicationMenu(Menu.buildFromTemplate(process.platform === 'win32'
+    Menu.setApplicationMenu(Menu.buildFromTemplate(selfDrawnChrome()
       ? windowsDevToolsShortcuts : [{
         label: darwin ? app.name : currentDesktopLocale().messages.application,
         submenu: [...applicationItems(), devToolsF12Shortcut],
@@ -1265,7 +1758,7 @@ async function main(): Promise<void> {
     ...(process.platform === 'win32' ? { icon: nativeImage.createFromPath(trayIconPath) } : {}),
   })
 
-  if (process.platform === 'win32') {
+  if (selfDrawnChrome()) {
     ipcMain.handle(DESKTOP_IPC.windowsMenu, (event, name: unknown, x: unknown, y: unknown) => {
       assertDesktopSender(event, ['app'])
       if (mainWindow === undefined || event.sender !== mainWindow.webContents
@@ -1326,8 +1819,16 @@ async function main(): Promise<void> {
     shortcuts.attach(window)
     window.on('focus', automaticCheck)
     // Closing hides: the page and the Host keep running, and the next show resumes the same document.
+    // AI Shell distribution (D17): on Linux, closing the window exits — the
+    // official close-to-background design has no return channel there (the
+    // tray and the background notice are win32-only, the Dock is darwin-only),
+    // so a hidden window read as a dead window with resident processes. The
+    // quit routes through the application's own quit chain, so the task
+    // confirmation (active or scheduled work) still asks before stopping.
+    // Windows and macOS keep the official semantics unchanged.
     window.on('close', (event) => {
       if (quitting || shellInstallerOwnsQuit || sessionEnding) return
+      if (process.platform === 'linux') { app.quit(); return }
       event.preventDefault()
       if (updateDialog.isOpen) { updateDialog.focus(); return }
       const hide = (): void => {
@@ -1469,7 +1970,14 @@ async function main(): Promise<void> {
       await enterWorkspace()
     }
   }
-  focusPrimaryWindow = () => {
+  // The `force` parameter is the deep-link summon semantics: a link click is
+  // an explicit user action on content the user already chose to see, so the
+  // no-peek guard below must not apply. The found case: a fresh install whose
+  // credential state left `enteredWorkspace` false while the window is fully
+  // visible — every warm deep link silently skipped focus (the field report
+  // behind the t023test.3 round). Callers reflecting the user's own
+  // navigation (menu, tray, second-instance without a URL) keep the guard.
+  focusPrimaryWindow = (force = false) => {
     if (quitting) return
     if (isMandatory()) { mandatoryUI?.focus(); return }
     const window = welcomeWindow ?? mainWindow
@@ -1479,17 +1987,57 @@ async function main(): Promise<void> {
       return
     }
     // Startup and sign-out select the visible window before activation may reveal the workspace.
-    if (window === mainWindow && !enteredWorkspace) return
+    // A deep-link delivery is the user's own summon (force): raise regardless.
+    if (!force && window === mainWindow && !enteredWorkspace) return
     if (window.isMinimized()) window.restore()
     window.show()
     window.focus()
   }
 
-  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('dsh')
-  app.on('open-url', (event, url) => {
-    event.preventDefault()
-    if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
-  })
+  // AI Shell distribution: register "aishell://" instead of "dsh://" so each
+  // app owns its own Windows URL-handler registry entry (HKCR\aishell vs
+  // HKCR\dsh). Sharing "dsh://" caused last-installed-wins overwrite and
+  // cross-app open-url races when the official DSH desktop and AI Shell
+  // coexist on one machine.
+  // AI Shell distribution (deeplink host delivery): registration authority
+  // (design §10.1 frozen ruling) — packaged LINUX does NOT call this: the
+  // install.sh URL-handler .desktop entry (Exec → the socket helper) is the
+  // only authority there, and Electron's runtime registration would steal
+  // the xdg default back to the bare binary on every app start, silently
+  // degrading the socket fast path to the slow spawn-a-second-Electron
+  // path. Dev-mode, mac, and win keep the runtime registration (with the
+  // exec args the OS appends when invoking for a URL — without them Linux
+  // never sees the URL on the command line).
+  // The open-url listener itself moved to module scope under
+  // will-finish-launching (macOS delivers URLs as early events).
+  const packagedLinux = process.platform === 'linux' && app.isPackaged
+  if (!packagedLinux && (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1')) {
+    app.setAsDefaultProtocolClient(AISHELL_DEEPLINK_SCHEME, process.execPath, ['--open-url', '--'])
+  }
+  // AI Shell distribution (deeplink host delivery, contract §12 adopted):
+  // the Linux-packaged socket fast path. The URL-handler helper connects to
+  // $XDG_RUNTIME_DIR/aishell-deeplink.sock and writes one `aishell://…\n`
+  // line per delivery — warm clicks never spawn a second Electron process.
+  // Bound in the owner process only (the single-instance lock was claimed
+  // at module scope, before main() ran); every failure path logs and skips
+  // (the argv fallback still delivers). Unlink-before-bind handles a stale
+  // file from a SIGKILLed owner; EADDRINUSE after unlink is a live
+  // different-owner edge — log + skip listening.
+  if (packagedLinux) {
+    // Focus-then-deliver (contract §5.3's second-instance semantics carried
+    // into the socket fast path): a warm click means the person acted on a
+    // link OUTSIDE this app — the window must rise with the delivery, or
+    // the preview modal lands behind the browser that dispatched the click
+    // (VM field finding: delivered but buried). The spawn fallback (the
+    // second-instance path) already focuses; this is the fast path's own
+    // hop, so the focus lives here.
+    const socket = new DeepLinkSocketListener((url) => { focusPrimaryWindow(true); deliverDeepLink(url) }, realSocketPlatform())
+    void socket.listen().catch((error: unknown) => {
+      console.warn(`aishell deeplink socket: listener failed (${error instanceof Error ? error.message : String(error)}) — skipping (argv fallback still delivers)`)
+    })
+    const previousDispose = disposeDeepLinkSocket
+    disposeDeepLinkSocket = async () => { await previousDispose(); await socket.dispose() }
+  }
 
   app.on('activate', (_event, hasVisibleWindows) => {
     if (!hasVisibleWindows) focusPrimaryWindow()
@@ -1558,10 +2106,10 @@ async function main(): Promise<void> {
         () => mandatoryUI?.confirmationWindow ?? currentDialogWindow(),
         (event) => { console.info(`desktop policy authentication: ${event}`); updateJournal?.action(`policy-login-${event}`) })
     }
-    if (!['win32', 'darwin'].includes(process.platform) || !['x64', 'arm64'].includes(process.arch)) throw new Error('desktop policy: unsupported platform')
+    if (!['win32', 'darwin', 'linux'].includes(process.platform) || !['x64', 'arm64'].includes(process.arch)) throw new Error('desktop policy: unsupported platform')
     let wasBlocking = false
     mandatoryPolicy = new DesktopMandatoryUpdatePolicy(policyConfig, {
-      platform: process.platform as 'win32' | 'darwin', arch: process.arch as 'x64' | 'arm64',
+      platform: process.platform as 'win32' | 'darwin' | 'linux', arch: process.arch as 'x64' | 'arm64',
       get channel() { return updates.selectedChannel },
       bundledDshVersion: app.isPackaged ? readDesktopRuntime(resources.dsh).release.version : app.getVersion(),
     }, (state) => {
@@ -1598,10 +2146,69 @@ async function main(): Promise<void> {
   if (window !== undefined && development && process.env.DSH_DESKTOP_OPEN_DEVTOOLS !== '0') {
     window.webContents.openDevTools({ mode: 'detach' })
   }
+  // AI Shell distribution (D19): with the bridge active, the bridge state
+  // IS the update state - republish it so late-attaching windows see the
+  // startup check's verdict rather than a stale idle.
+  if (updateBridge !== undefined) publishUpdate(updateBridge.status)
   publishUpdate(updateState)
 }
 
-const ownsDesktopInstance = claimDesktopSingleInstance(app, () => { focusPrimaryWindow() })
+// AI Shell distribution: claim a single-instance lock key distinct from the
+// official DSH desktop app. Electron's requestSingleInstanceLock keys on
+// app.name, which defaults to package.json's "name" — identical
+// ("@deepseek-ai/dsh-desktop") across the official and AI Shell builds.
+// Without this, the app that starts second sees the first's lock and
+// silently quits. Set at module top level before the lock claim below;
+// main() runs too late (after whenReady). Mirrors the upstream dev build's
+// per-bundle CFBundleIdentifier (development-app.ts) for the same reason.
+app.setName('AI Shell')
+
+// AI Shell distribution (linux-support): pin the display backend to X11.
+// The 0.2.2-rc.3 base's Chromium auto-selects native Wayland whenever
+// WAYLAND_DISPLAY is set, and under GNOME Wayland mutter rejects an
+// application's own window-activation requests (window.show()/focus() are
+// silently ignored — no xdg-activation token is honored by this Electron
+// for the deep-link summon, the menu raise, or the update dialogs), so a
+// link click delivered the preview behind the browser with the app never
+// coming forward (VM field finding on 0.0.3-test.2: healthy process +
+// socket + Host, zero focus). XWayland is the display mode every released
+// build and the whole verify battery run under — pin it back. Revisit when
+// Electron honors xdg-activation for focus (then native Wayland may return
+// with a real focus audit).
+if (process.platform === 'linux') app.commandLine.appendSwitch('ozone-platform', 'x11')
+
+// AI Shell distribution (deeplink host delivery, contract §5.3): macOS
+// delivers URLs as `open-url` events that may fire BEFORE ready — the
+// listener must exist during launch, not inside main() (which runs after
+// whenReady and loses early events). `will-finish-launching` is the
+// documented early window; registration happens at module scope, before the
+// single-instance claim below. `aishell://open` keeps its focus-only
+// behavior (D1 ruling: dead code — login is blocked, no live producer;
+// revisit only if login returns). Every OTHER aishell:// URL is delivered
+// unmodified (the legacy literal check is a string comparison, not a parse).
+app.on('will-finish-launching', () => {
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    if (isOpenLiteral(url)) focusPrimaryWindow()
+    else if (url.startsWith(`${AISHELL_DEEPLINK_SCHEME}://`)) { focusPrimaryWindow(true); deliverDeepLink(url) }
+  })
+})
+// Cold start: the URL is in this process's own argv (every platform).
+// Scanned once, early — the hub stashes it until the Host child is ready.
+{
+  const initialUrl = findDeepLink(process.argv)
+  if (initialUrl !== undefined && !isOpenLiteral(initialUrl)) deliverDeepLink(initialUrl)
+}
+
+const ownsDesktopInstance = claimDesktopSingleInstance(app, (argv) => {
+  focusPrimaryWindow()
+  // AI Shell distribution (deeplink host delivery): the later launch's argv
+  // carries the URL (Linux/Windows second-instance path — the fallback for
+  // the cold-start race window: lock taken, socket not yet bound, helper's
+  // spawn path lands here). Scan and deliver; the string is never parsed.
+  const url = findDeepLink(argv)
+  if (url !== undefined) deliverDeepLink(url)
+})
 
 if (ownsDesktopInstance) void app.whenReady().then(main).catch(async (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error)
