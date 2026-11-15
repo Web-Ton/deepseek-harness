@@ -113,6 +113,23 @@ describe('desktop welcome Web operations', () => {
     await expect(backend.read()).rejects.toThrow('Web RPC failed')
   })
 
+  it('bounds the boot preferences read so a silent Host cannot hang the first window forever', async () => {
+    // The VM cold-start field finding: process + Host + socket healthy, but
+    // zero windows — openInitialWindow awaits readPreferences, and an
+    // answerless settings describe (connection accepted, no response) used
+    // to hang the boot's ONLY window-creation path with no deadline. The
+    // 1s floor mirrors the analytics reads; the caller's catch falls back
+    // to the system locale and theme. Real timers on purpose: the deadline
+    // is the behavior under test.
+    // The send seam mirrors fetch's contract: an aborted signal rejects the
+    // pending request (a fetch that never listens to its signal would hang
+    // this floor — the seam carries the signal, the transport honors it).
+    const backend = connectDesktopWelcome(url, cookie, (_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')))
+    }))
+    await expect(backend.readPreferences()).rejects.toThrow('aborted')
+  })
+
   it('submits native analytics through authenticated RPC with a bounded request', async () => {
     const host = transport()
     const backend = connectDesktopWelcome(url, cookie, host.send)

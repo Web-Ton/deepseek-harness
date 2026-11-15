@@ -25,6 +25,8 @@ export interface DesktopWelcomeBackend {
   read(): Promise<WelcomeState>
   /** @returns The saved UI language without account or provider requests. */
   readLocalePreference(): Promise<string | null>
+  /** Locale and theme preferences from one settings read; theme defaults to system. */
+  readPreferences(): Promise<{ localePreference: string | null; themePreference: WelcomeState['themePreference'] }>
   /**
    * @param apiKey - User-entered official provider key.
    * @returns A safe write outcome without provider diagnostics.
@@ -142,6 +144,21 @@ export function connectDesktopWelcome(
       const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} })
       if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
       return localePreference(settings.namespaces)
+    },
+    async readPreferences() {
+      // The boot's window-creation path awaits this read (openInitialWindow);
+      // unlike the analytics reads this RPC had no deadline, so a Host that
+      // accepts the connection but never answers the settings describe hung
+      // the FIRST window forever (VM field finding: process + Host + socket
+      // healthy, zero windows on the X tree). Same floor as the analytics
+      // reads: 1s deadline, and the caller's catch already falls back to the
+      // system locale and theme — the boot never dies on this RPC.
+      const settings = await invoke({ namespace: 'settings', method: 'describe', args: {} }, AbortSignal.timeout(1000))
+      if (!record(settings) || !Array.isArray(settings.namespaces)) throw new Error('desktop welcome: missing settings namespaces')
+      return {
+        localePreference: localePreference(settings.namespaces),
+        themePreference: themePreference(settings.namespaces),
+      }
     },
     async save(apiKey) {
       if (!/^[\x21-\x7e]+$/.test(apiKey)) return { ok: false }
